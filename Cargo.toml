@@ -1,0 +1,27 @@
+[[bin]]
+name = "thumbs-collage"
+path = "src/main.rs"
+
+[package]
+name = "thumbs-collage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.6", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.3", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+ffmpeg-next = "8.0"
+image = "0.24.9"
+imageproc = "0.23.0"
+ab_glyph = "0.2"
+rusttype = "0.9"
+base64 = "0.21"
+num_cpus = "1.16"
+bytes = "1.4"
+futures = "0.3"
+tower = "0.4"

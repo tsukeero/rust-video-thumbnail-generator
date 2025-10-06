@@ -1,0 +1,15 @@
+target
+.vscode
+collage_output*.jpg
+node_modules
+vid_bad*
+test_videos/
+test_output/
+
+*.exe
+
+//remove all js files
+*.js
+package.json
+package-lock.json
+pnpm-lock.yaml

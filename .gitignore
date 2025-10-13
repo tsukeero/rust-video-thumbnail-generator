@@ -4,6 +4,7 @@ collage_output*.jpg
 node_modules
 vid_bad*
 test_videos/
+test_videos_all/
 test_output/
 
 *.exe

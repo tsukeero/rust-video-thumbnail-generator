@@ -190,9 +190,9 @@ async function executeJob(filename: string, outputFilename: string, customJobId:
     // force_fallback: 1,
     selection: {
       start_offset: 10.0,
-      end_offset: 90.0,
+      end_offset: 60.0,
       mode: "uniform",
-      frames: 25
+      frames: 28
     }
   };
 

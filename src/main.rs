@@ -773,7 +773,7 @@ fn extract_frames_seek_each(
                         // Frame is blank, retry with forward seek if possible
                         retry_count += 1;
                         if retry_count <= max_retries && current_ts + 2.0 < duration {
-                            current_ts += 1.5; // Move forward 1.5 seconds
+                            current_ts += 2.5; // Move forward 1.5 seconds
                             continue;
                         }
                     }
@@ -1015,6 +1015,7 @@ fn extract_frames_sequential(
 
 /// Calculate pixel variance from luminance samples
 /// Returns true if variance is below threshold (indicating blank/solid frame)
+/// Also detects nearly-white or nearly-black frames by checking mean luminance
 fn is_blank_by_variance(samples: &[f32]) -> bool {
     if samples.is_empty() {
         return false;
@@ -1025,7 +1026,25 @@ fn is_blank_by_variance(samples: &[f32]) -> bool {
         .map(|&x| (x - mean).powi(2))
         .sum::<f32>() / samples.len() as f32;
 
-    variance < 300.0
+    println!("Blank check: variance={:.2}, mean={:.2}, samples={}", variance, mean, samples.len());
+
+    // Low variance frames (solid colors)
+    if variance < 500.0 {
+        return true;
+    }
+
+    // Nearly-white frames: high mean (close to 255) with low-to-medium variance
+    // White frames often have compression artifacts, so variance can be 1000-2000
+    if mean > 230.0 && variance < 3000.0 {
+        return true;
+    }
+
+    // Nearly-black frames: low mean (close to 0) with low-to-medium variance
+    if mean < 25.0 && variance < 3000.0 {
+        return true;
+    }
+    println!("NOT BLANK: variance={:.2}, mean={:.2}, samples={}", variance, mean, samples.len());
+    false
 }
 
 /// Check if a frame is mostly blank (black, white, or solid color) by calculating pixel variance

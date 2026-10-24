@@ -23,7 +23,7 @@ jobs:
       tag: ${{ steps.get_version.outputs.tag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Get version
         id: get_version
@@ -58,7 +58,6 @@ jobs:
           ### Downloads
           - **Windows (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-windows-x86_64.zip`
           - **Linux (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz`
-          - **macOS (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-macos-x86_64.tar.gz`
           - **macOS (aarch64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-macos-aarch64.tar.gz`
 
           ### Installation
@@ -77,7 +76,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.create-release.outputs.tag }}
 
@@ -124,7 +123,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.create-release.outputs.tag }}
 
@@ -167,26 +166,18 @@ jobs:
   build-macos:
     name: Build macOS
     needs: create-release
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Build each arch on a native runner: Homebrew FFmpeg is single-arch, so cross-compiling can't link
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-          - target: aarch64-apple-darwin
-            runner: macos-latest
+    # Apple Silicon only: Homebrew no longer ships FFmpeg 8 bottles for Intel Macs
+    runs-on: macos-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Install FFmpeg
         run: |
@@ -195,20 +186,18 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target aarch64-apple-darwin
 
       - name: Package
         run: |
           VERSION="${{ needs.create-release.outputs.version }}"
-          TARGET="${{ matrix.target }}"
-          ARCH="${TARGET%%-*}"
-          ARCHIVE="thumbs-collage-${VERSION}-macos-${ARCH}"
+          ARCHIVE="thumbs-collage-${VERSION}-macos-aarch64"
           mkdir -p "$ARCHIVE"
-          cp "target/${TARGET}/release/thumbs-collage" "$ARCHIVE/"
+          cp "target/aarch64-apple-darwin/release/thumbs-collage" "$ARCHIVE/"
           cp "README.md" "$ARCHIVE/"
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
 
       - name: Upload Release Asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.create-release.outputs.tag }}" "./thumbs-collage-${{ needs.create-release.outputs.version }}-macos-${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'aarch64' }}.tar.gz"
+        run: gh release upload "${{ needs.create-release.outputs.tag }}" "./thumbs-collage-${{ needs.create-release.outputs.version }}-macos-aarch64.tar.gz"

@@ -11,13 +11,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.get_version.outputs.tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -44,31 +47,28 @@ jobs:
           git push origin "${{ steps.get_version.outputs.tag }}"
 
       - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.get_version.outputs.tag }}
-          release_name: Release ${{ steps.get_version.outputs.tag }}
-          body: |
-            ## Changes in ${{ steps.get_version.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.get_version.outputs.tag }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Changes in ${{ steps.get_version.outputs.tag }}
 
-            ### Downloads
-            - **Windows (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-windows-x86_64.zip`
-            - **Linux (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz`
-            - **macOS (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-macos-x86_64.tar.gz`
-            - **macOS (aarch64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-macos-aarch64.tar.gz`
+          ### Downloads
+          - **Windows (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-windows-x86_64.zip`
+          - **Linux (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz`
+          - **macOS (x86_64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-macos-x86_64.tar.gz`
+          - **macOS (aarch64)**: `thumbs-collage-${{ steps.get_version.outputs.version }}-macos-aarch64.tar.gz`
 
-            ### Installation
-            1. Download the appropriate archive for your platform
-            2. Extract the archive
-            3. Ensure FFmpeg 8.0+ is installed on your system
-            4. Run the binary: `./thumbs-collage --help`
+          ### Installation
+          1. Download the appropriate archive for your platform
+          2. Extract the archive
+          3. Ensure FFmpeg 8.0+ is installed on your system
+          4. Run the binary: `./thumbs-collage --help`
 
-            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
-          draft: false
-          prerelease: false
+          See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+          NOTES
+          gh release create "$TAG" --title "Release $TAG" --notes-file notes.md
 
   build-windows:
     name: Build Windows
@@ -87,8 +87,8 @@ jobs:
 
       - name: Download and setup FFmpeg
         run: |
-          # Download FFmpeg 8.0 shared build
-          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip" -OutFile "ffmpeg.zip"
+          # Download FFmpeg 8.1 shared build (master is FFmpeg 9+, which ffmpeg-next 8.x can't build against)
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip" -OutFile "ffmpeg.zip"
           Expand-Archive -Path "ffmpeg.zip" -DestinationPath "."
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
           $env:FFMPEG_DIR = $ffmpegDir.FullName
@@ -113,14 +113,9 @@ jobs:
           Compress-Archive -Path $ARCHIVE -DestinationPath "${ARCHIVE}.zip"
 
       - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./thumbs-collage-${{ needs.create-release.outputs.version }}-windows-x86_64.zip
-          asset_name: thumbs-collage-${{ needs.create-release.outputs.version }}-windows-x86_64.zip
-          asset_content_type: application/zip
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.create-release.outputs.tag }}" "./thumbs-collage-${{ needs.create-release.outputs.version }}-windows-x86_64.zip"
 
   build-linux:
     name: Build Linux
@@ -164,24 +159,23 @@ jobs:
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
 
       - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./thumbs-collage-${{ needs.create-release.outputs.version }}-linux-x86_64.tar.gz
-          asset_name: thumbs-collage-${{ needs.create-release.outputs.version }}-linux-x86_64.tar.gz
-          asset_content_type: application/gzip
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.create-release.outputs.tag }}" "./thumbs-collage-${{ needs.create-release.outputs.version }}-linux-x86_64.tar.gz"
 
   build-macos:
     name: Build macOS
     needs: create-release
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
+        include:
+          # Build each arch on a native runner: Homebrew FFmpeg is single-arch, so cross-compiling can't link
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -194,7 +188,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install FFmpeg
-        run: brew install ffmpeg pkg-config
+        run: |
+          # Default ffmpeg formula is 9.x; ffmpeg@8 is keg-only so point pkg-config at it
+          brew install ffmpeg@8 pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -211,11 +208,6 @@ jobs:
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
 
       - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./thumbs-collage-${{ needs.create-release.outputs.version }}-macos-${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'aarch64' }}.tar.gz
-          asset_name: thumbs-collage-${{ needs.create-release.outputs.version }}-macos-${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'aarch64' }}.tar.gz
-          asset_content_type: application/gzip
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.create-release.outputs.tag }}" "./thumbs-collage-${{ needs.create-release.outputs.version }}-macos-${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'aarch64' }}.tar.gz"

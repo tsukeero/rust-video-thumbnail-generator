@@ -54,6 +54,36 @@ struct Args {
     /// Progress update interval in milliseconds (default: 200ms)
     #[arg(long, default_value_t = 200)]
     progress_interval_ms: u64,
+
+    /// Exit when stdin is closed (EOF). Lets a parent process that holds our stdin pipe
+    /// take us down with it when it dies or is killed (useful on Windows, which has no
+    /// parent-death signal). Do not use with stdin redirected from /dev/null or NUL.
+    #[arg(long)]
+    exit_on_stdin_close: bool,
+}
+
+/// Spawn a watcher thread that blocks reading stdin and exits the process on EOF or error.
+/// Uses a plain OS thread rather than tokio's stdin, whose blocking read would keep the
+/// runtime from shutting down.
+fn spawn_stdin_close_watcher() {
+    std::thread::Builder::new()
+        .name("stdin-watcher".into())
+        .spawn(|| {
+            use std::io::Read;
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue, // discard any input, we only care about closure
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break, // e.g. ERROR_BROKEN_PIPE on Windows when the parent dies
+                }
+            }
+            eprintln!("stdin closed, exiting");
+            std::process::exit(0);
+        })
+        .expect("failed to spawn stdin watcher thread");
 }
 
 // Progress tracking
@@ -220,6 +250,10 @@ struct Rect { x: u32, y: u32, w: u32, h: u32 }
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.exit_on_stdin_close {
+        spawn_stdin_close_watcher();
+    }
 
     // init ffmpeg once
     ffmpeg::init().context("ffmpeg init failed")?;

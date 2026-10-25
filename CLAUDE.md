@@ -311,6 +311,8 @@ Options:
                                 2 = sequential fallback (most permissive)
   --ws-progress                 Enable WebSocket progress endpoint at /ws-progress
   --progress-interval-ms <MS>   Progress update interval [default: 200]
+  --exit-on-stdin-close         Exit when stdin reaches EOF/breaks (parent died).
+                                Parent must spawn with a piped stdin and keep it open
   -h, --help                    Print help
 ```
 

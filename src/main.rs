@@ -768,6 +768,9 @@ fn extract_frames_seek_each(
 
     let mut results: Vec<Option<(DynamicImage, f64)>> = Vec::with_capacity(timestamps.len());
     let mut found_corruption = false;
+    // Skip to a keyframe when a seek lands on a non-keyframe; turned off for the rest of the
+    // job if the stream turns out not to flag keyframes at all
+    let mut require_keyframe = true;
 
     for (i, &ts) in timestamps.iter().enumerate() {
         // Target size hint
@@ -798,7 +801,15 @@ fn extract_frames_seek_each(
             decoder.flush();
 
             // Extract frame at this position
-            frame_result = extract_frame_after_seek(&mut ictx, &mut decoder, stream_index, seconds_per_tick, current_ts, target_w, target_h, fit_mode, video_aspect, false, duration);
+            frame_result = extract_frame_after_seek(&mut ictx, &mut decoder, stream_index, seconds_per_tick, current_ts, target_w, target_h, fit_mode, video_aspect, require_keyframe, duration);
+
+            // No keyframe packet near the target: the stream doesn't flag keyframes (e.g.
+            // intra-refresh H.264). Retry this position without the keyframe requirement.
+            if matches!(&frame_result, Err(e) if e.is::<NoKeyframeFound>()) {
+                eprintln!("No keyframe found after seek to {:.1}s, disabling keyframe requirement for {}", current_ts, path);
+                require_keyframe = false;
+                continue;
+            }
 
             // Check for blank frames ONLY if we got a successful result
             if frame_result.is_ok() && skip_blank_frames {
@@ -965,7 +976,7 @@ fn extract_frames_sequential(
 
         while decoder.receive_frame(&mut decoded).is_ok() {
             frames_decoded += 1;
-            let frame_pts = decoded.pts().unwrap_or(0);
+            let frame_pts = decoded.timestamp().or(packet.dts()).unwrap_or(0);
             let frame_seconds = frame_pts as f64 * seconds_per_tick;
 
             // Update progress based on video position
@@ -1191,10 +1202,32 @@ fn decode_and_scale_frame(
     Ok(DynamicImage::ImageRgb8(img).to_rgba8().into())
 }
 
+/// How far past the target to look for a keyframe packet when a seek lands on a non-keyframe
+const KEYFRAME_SEARCH_WINDOW_SECS: f64 = 15.0;
+/// Packet cap for the keyframe search, for streams without packet timestamps
+const KEYFRAME_SEARCH_MAX_PACKETS: usize = 1000;
+
+/// No keyframe packet was found within the search window after a seek
+#[derive(Debug)]
+struct NoKeyframeFound;
+
+impl std::fmt::Display for NoKeyframeFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no keyframe found within {}s after seek target", KEYFRAME_SEARCH_WINDOW_SECS)
+    }
+}
+
+impl std::error::Error for NoKeyframeFound {}
+
 /// Extract a frame after seeking (assumes seek has already been performed).
 /// Decodes frames and finds the one closest to the target timestamp.
 /// Returns (frame, had_errors_in_group) where had_errors_in_group indicates
 /// if any frame since the last keyframe had decode errors.
+///
+/// With `require_keyframe`, packets before the first keyframe packet are dropped without
+/// decoding. A broken index (e.g. AVI with every entry flagged as keyframe) makes the seek
+/// land on a P-frame, which MPEG-4 decodes against a gray reference without setting any
+/// decode error flags. Returns `NoKeyframeFound` if no keyframe appears within the window.
 fn extract_frame_after_seek(
     ictx: &mut ffmpeg::format::context::Input,
     decoder: &mut ffmpeg::decoder::Video,
@@ -1205,19 +1238,37 @@ fn extract_frame_after_seek(
     target_h: u32,
     fit_mode: FitMode,
     video_aspect: f64,
-    relaxed_limits: bool,
+    require_keyframe: bool,
     duration: f64,
 ) -> Result<(DynamicImage, f64, bool)> {
-    let mut best_frame: Option<DynamicImage> = None;
+    let mut best_frame: Option<FfmpegFrame> = None;
     let mut best_frame_timestamp = 0.0;
     let mut best_frame_distance = f64::MAX;
     let mut frames_decoded = 0;
     let mut had_errors_in_group = false; // Track if any frame had errors
+    let mut synced = !require_keyframe;
+    let mut skipped_packets = 0;
 
     // Decode frames and find the one closest to our target timestamp
     for (s, packet) in ictx.packets() {
         if s.index() != stream_index {
             continue;
+        }
+
+        // Healthy files land on a keyframe, so this is a single flag check for them
+        if !synced {
+            if packet.is_key() {
+                synced = true;
+            } else {
+                skipped_packets += 1;
+                let past_window = packet.dts()
+                    .map(|dts| dts as f64 * seconds_per_tick > timestamp + KEYFRAME_SEARCH_WINDOW_SECS)
+                    .unwrap_or(false);
+                if past_window || skipped_packets >= KEYFRAME_SEARCH_MAX_PACKETS {
+                    return Err(NoKeyframeFound.into());
+                }
+                continue;
+            }
         }
 
         decoder.send_packet(&packet)?;
@@ -1226,100 +1277,27 @@ fn extract_frame_after_seek(
         while decoder.receive_frame(&mut decoded).is_ok() {
             frames_decoded += 1;
 
-            // Get frame timestamp
-            let frame_pts = decoded.pts().unwrap_or(0);
+            // Get frame timestamp (best effort: falls back to DTS for containers without PTS, e.g. AVI)
+            let frame_pts = decoded.timestamp().or(packet.dts()).unwrap_or(0);
             let frame_seconds = frame_pts as f64 * seconds_per_tick;
 
             // Calculate distance from target
             let distance = (frame_seconds - timestamp).abs();
 
             // Check if this frame has decode errors (indicates corruption/garbage)
-            // Also check if it's a keyframe (more reliable for corrupted videos)
-            let (has_errors, is_keyframe) = unsafe {
-                let frame_ptr = decoded.as_ptr();
-                let errors = (*frame_ptr).decode_error_flags != 0;
-                //FOR FFMPEG 8.0, old ways was ((*frame_ptr).decode_error_flags != 0, (*frame_ptr).key_frame == 1)
-                let keyframe = ((*frame_ptr).flags & ffi::AV_FRAME_FLAG_KEY) != 0;
-                (errors, keyframe)
-            };
+            let has_errors = unsafe { (*decoded.as_ptr()).decode_error_flags != 0 };
 
             // Track if we encountered any errors in this GOP (Group of Pictures)
             if has_errors {
                 had_errors_in_group = true;
             }
 
-            // Only use frames that:
-            // 1. Have no decode errors
-            // 2. Are keyframes (in relaxed mode, for corrupted videos)
-            // 3. Are closer to target than current best
-            let should_use = if !has_errors {
-                if relaxed_limits {
-                    // Relaxed mode (corrupted video): ONLY use clean keyframes
-                    is_keyframe && distance < best_frame_distance
-                } else {
-                    // Normal mode: use any clean frame
-                    distance < best_frame_distance
-                }
-            } else {
-                false
-            };
+            // Only use frames that have no decode errors and are closer to target than current best
+            let should_use = !has_errors && distance < best_frame_distance;
 
             if should_use {
-                // Calculate scaled dimensions based on fit mode
-                let (scale_w, scale_h) = match fit_mode {
-                    FitMode::Stretch => {
-                        // Stretch: scale to exact rect dimensions (may distort)
-                        (target_w, target_h)
-                    }
-                    FitMode::Cover | FitMode::Contain => {
-                        // Cover/Contain: maintain aspect ratio, scale to cover target
-                        let target_aspect = target_w as f64 / target_h as f64;
-                        if video_aspect > target_aspect {
-                            // Source is wider: fit to height
-                            let h = target_h;
-                            let w = (h as f64 * video_aspect).round() as u32;
-                            (w, h)
-                        } else {
-                            // Source is taller: fit to width
-                            let w = target_w;
-                            let h = (w as f64 / video_aspect).round() as u32;
-                            (w, h)
-                        }
-                    }
-                };
-
-                // Convert to RGB and scale
-                let mut rgb = FfmpegFrame::empty();
-                let mut scaler = Scaler::get(
-                    decoded.format(),
-                    decoded.width(),
-                    decoded.height(),
-                    ffmpeg::format::pixel::Pixel::RGB24,
-                    scale_w,
-                    scale_h,
-                    Flags::BILINEAR,
-                )?;
-                scaler.run(&decoded, &mut rgb)?;
-
-                // Important: FFmpeg might add padding to each line for alignment
-                // We need to copy line-by-line respecting the stride
-                let width = rgb.width() as usize;
-                let height = rgb.height() as usize;
-                let stride = rgb.stride(0);
-                let data = rgb.data(0);
-
-                // Copy without padding
-                let mut rgb_data = Vec::with_capacity(width * height * 3);
-                for y in 0..height {
-                    let line_start = y * stride;
-                    let line_end = line_start + (width * 3);
-                    rgb_data.extend_from_slice(&data[line_start..line_end]);
-                }
-
-                let img = image::RgbImage::from_raw(width as u32, height as u32, rgb_data)
-                    .ok_or_else(|| anyhow::anyhow!("failed to create image from raw data"))?;
-
-                best_frame = Some(DynamicImage::ImageRgb8(img).to_rgba8().into());
+                // Keep the raw frame and scale only the final pick; take ownership instead of copying
+                best_frame = Some(std::mem::replace(&mut decoded, FfmpegFrame::empty()));
                 best_frame_timestamp = frame_seconds;
                 best_frame_distance = distance;
             }
@@ -1335,26 +1313,15 @@ fn extract_frame_after_seek(
             }
         }
 
-        // Early exit optimization: stop after a few frames if we found something close
-        // Use relaxed limits for retry attempts on corrupted videos
-        if best_frame.is_some() {
-            if relaxed_limits {
-                // Corrupted video retry: only exit if very close to target
-                if best_frame_distance < 0.1 {
-                    break;
-                }
-            } else {
-                // Normal case: exit after 5 frames or when close enough
-                if frames_decoded >= 5 || best_frame_distance < 0.5 {
-                    break;
-                }
-            }
+        // Early exit optimization: stop after 5 frames or when close enough
+        if best_frame.is_some() && (frames_decoded >= 5 || best_frame_distance < 0.5) {
+            break;
         }
     }
 
-    best_frame
-        .map(|f| (f, best_frame_timestamp, had_errors_in_group))
-        .ok_or_else(|| anyhow::anyhow!("no frames found"))
+    let best_frame = best_frame.ok_or_else(|| anyhow::anyhow!("no frames found"))?;
+    let img = decode_and_scale_frame(&best_frame, target_w, target_h, fit_mode, video_aspect)?;
+    Ok((img, best_frame_timestamp, had_errors_in_group))
 }
 
 /// derive grid output size when only width or only height provided

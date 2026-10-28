@@ -43,6 +43,9 @@ The service uses a multi-tiered extraction strategy with automatic fallback for 
 
 **Key Features**:
 - **Corruption Detection**: Checks `decode_error_flags` on every frame
+- **Keyframe Sync After Seek**: If the first video packet after a seek isn't a keyframe (broken index, e.g. AVI with every index entry flagged as keyframe), packets are dropped without decoding until the next keyframe packet. MPEG-4 Part 2 decodes such P-frames against a gray reference without setting `decode_error_flags`, so this is the only signal. Costs one flag check on healthy files. If no keyframe appears within 15s, the requirement is turned off for the rest of the job (streams that don't flag keyframes, e.g. intra-refresh H.264)
+- **Best-Effort Timestamps**: Uses `frame.timestamp()` (`best_effort_timestamp`, falls back to packet DTS) instead of `pts`, which is missing in AVI
+- **Deferred Scaling**: Keeps the best raw frame and scales only the final pick
 - **Blank Frame Retry**: If variance < 300, seeks forward 1.5s (up to 10 retries)
 - **Error Tracking**: Returns tuple `(frame, timestamp, had_errors_in_group)` to detect corrupt GOPs
 - **Aspect Ratio Preservation**: Scales frames maintaining video aspect ratio
@@ -131,7 +134,7 @@ async fn handle_ws_progress(socket: WebSocket, state: AppState) {
 **Multiple Layers**:
 1. **FFmpeg Decode Error Flags**: Checks `frame.decode_error_flags != 0`
 2. **GOP-Level Tracking**: Tracks if any frame in a Group of Pictures had errors
-3. **Keyframe Preference**: In retry mode, prefers keyframes over P/B frames
+3. **Keyframe Sync**: In seek mode, skips to the next keyframe packet when a seek lands on a non-keyframe
 4. **Error Suppression**: Sets FFmpeg log level to `Fatal` during fallback to reduce spam
 
 **Key Insight**: P/B frames may appear "clean" but are corrupted if they depend on a corrupted keyframe. The service detects this by tracking errors across entire GOPs.

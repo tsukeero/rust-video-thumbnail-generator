@@ -1,69 +1,76 @@
 # Video Thumbnail Collage Service
 
-A high-performance Rust HTTP service that extracts frames from videos and generates thumbnail collages. Built with FFmpeg for video processing and Axum for async HTTP handling.
+A Rust HTTP service that extracts frames from videos and assembles them into thumbnail collages. Built on FFmpeg for decoding and Axum for async HTTP.
 
 ## Features
 
-- ⚡ **Ultra-Fast Extraction**: Index-based seeking extracts frames 10-100x faster than naive decoding
-- 🛡️ **Robust Corruption Handling**: Multi-tier fallback system handles damaged videos gracefully
-- 🎬 **Frame Extraction**: Extract frames at specific timestamps or uniformly across a video
+- ⚡ **Fast Extraction**: Index-based seeking, typically 10-100ms per frame on healthy files
+- 🛡️ **Corruption Handling**: Multi-tier fallback (seek → keyframe-only → full sequential decode) for damaged videos
+- 🎬 **Frame Selection**: Uniformly spaced frames or explicit timestamps
 - 🖼️ **Flexible Layouts**: Grid mode or custom percentage-based layouts
-- ⏱️ **Timestamp Overlays**: Optional timestamp rendering on thumbnails (shows actual extracted frame time)
-- 📊 **Rich Metadata**: JSON metadata embedded in each JPEG file with request config and actual timestamps
-- 🚀 **High Performance**: Async HTTP with semaphore-based concurrency control
-- 🎨 **Image Fitting**: Cover, contain, or stretch modes for aspect ratio handling
-- 🔍 **Blank Frame Detection**: Automatic detection and skipping of blank/solid color frames
-- 📡 **WebSocket Progress**: Real-time progress updates via WebSocket for long-running jobs
+- ⏱️ **Timestamp Overlays**: Optional timestamp rendering showing the actual extracted frame time
+- 📊 **Embedded Metadata**: JSON metadata in the JPEG COM marker and an HTTP header
+- 🎨 **Fit Modes**: Cover, contain, or stretch
+- 🔍 **Blank Frame Skipping**: Detects black, white, and solid-color frames and seeks past them
+- 📡 **WebSocket Progress**: Real-time progress updates for long-running jobs
 
 ## Quick Start
 
-### Prerequisites
+### Pre-built Binaries
 
-- **Rust**: 1.70 or later
-- **FFmpeg**: Shared libraries (`.dll` on Windows, `.so` on Linux, `.dylib` on macOS)
-  - Recommended: FFmpeg 8.0 or later
+Windows, Linux and macOS (Apple Silicon) builds are available on the [Releases](https://github.com/tsukeero/rust-video-thumbnail-generator/releases) page. The Windows archive includes the FFmpeg DLLs; on Linux and macOS install FFmpeg 8.x shared libraries from your package manager.
 
-### Installation
+### Building from Source
+
+Prerequisites:
+
+- **Rust**: recent stable toolchain
+- **FFmpeg 8.x**: development libraries / shared build (`ffmpeg-next` 8.x does not build against FFmpeg 9)
+- **clang** and **pkg-config** (Linux/macOS, used by the FFmpeg bindings)
 
 1. **Clone the repository**:
    ```bash
-   git clone <repo-url>
-   cd rust-thumbnail-service
+   git clone https://github.com/tsukeero/rust-video-thumbnail-generator.git
+   cd rust-video-thumbnail-generator
    ```
 
-2. **Set FFmpeg path (Windows)**:
-   ```bash
+2. **Point the build at FFmpeg (Windows only)**:
+   ```bat
    set FFMPEG_DIR=C:\path\to\ffmpeg
    ```
+   `build.rs` copies the DLLs from `%FFMPEG_DIR%\bin` next to the built executable.
 
-3. **Build the project**:
+3. **Build**:
    ```bash
    cargo build --release
    ```
 
-4. **Run the service**:
+4. **Run**:
    ```bash
-   ./target/release/thumbs-collage --bind 0.0.0.0:3000 --font-file /path/to/font.ttf --ws-progress
+   ./target/release/thumbs-collage --bind 127.0.0.1:3000 --font-file /path/to/font.ttf --ws-progress
    ```
 
-### With All Features Enabled
+   Without `--bind` the server picks a random free port on `127.0.0.1`. The bound address is printed on startup as `Listening on http://...`.
+
+### With All Options
 
 ```bash
 ./target/release/thumbs-collage \
-  --bind 0.0.0.0:3000 \
+  --bind 127.0.0.1:3000 \
   --font-file /path/to/arial.ttf \
   --ws-progress \
   --progress-interval-ms 200 \
   --max-workers 4 \
   --jpeg-quality 85 \
-  --allow-fallback 2
+  --allow-fallback 2 \
+  --root-path /videos
 ```
 
 ## Usage
 
 ### Basic Example: 5x5 Grid with Blank Frame Skipping
 
-Extract 25 evenly-spaced frames and arrange them in a 5x5 grid, automatically skipping blank frames:
+Extract 25 evenly spaced frames into a 5x5 grid, skipping blank frames:
 
 ```bash
 curl -X POST http://localhost:3000/make_collage \
@@ -91,11 +98,9 @@ curl -X POST http://localhost:3000/make_collage \
 
 ### Advanced Example: Custom Layout
 
-Create a custom layout with specific frame positions:
-
 ```bash
 curl -X POST http://localhost:3000/make_collage \
-  -H "Content-Type": application/json" \
+  -H "Content-Type: application/json" \
   -d '{
     "path": "/videos/movie.mp4",
     "selection": {
@@ -115,15 +120,12 @@ curl -X POST http://localhost:3000/make_collage \
       "background": {"r": 0, "g": 0, "b": 0, "a": 255}
     },
     "fit": "contain"
-  }'
+  }' --output collage.jpg
 ```
 
-### Using WebSocket Progress Monitoring
-
-See `test_ws_progress_deno.ts` for a complete example of monitoring progress via WebSocket:
+### WebSocket Progress Monitoring
 
 ```typescript
-// Connect to progress endpoint
 const ws = new WebSocket('ws://127.0.0.1:3000/ws-progress');
 
 ws.onmessage = (event) => {
@@ -133,17 +135,18 @@ ws.onmessage = (event) => {
   console.log(`  Message: ${progress.message}`);
 };
 
-// Make request with custom job_id
 fetch('http://127.0.0.1:3000/make_collage', {
   method: 'POST',
   headers: {'Content-Type': 'application/json'},
   body: JSON.stringify({
-    job_id: 'my-custom-job-1',  // Optional: track this specific job
+    job_id: 'my-custom-job-1',  // optional: lets you match progress messages to this request
     path: '/videos/movie.mp4',
     // ... rest of config
   })
 });
 ```
+
+See `test_ws_progress_deno.ts` for a complete client.
 
 ## API Reference
 
@@ -153,30 +156,30 @@ fetch('http://127.0.0.1:3000/make_collage', {
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | string | Yes | Path to video file on server |
+| `path` | string | Yes | Path to the video file on the server (relative to `--root-path` if set) |
 | `selection` | object | Yes | Frame selection strategy (see below) |
 | `collage` | object | Yes | Layout specification (see below) |
 | `fit` | string | No | `"cover"`, `"contain"`, or `"stretch"` (default: `"cover"`) |
-| `render_timestamps` | boolean | No | Render timestamps on frames (default: `false`) |
+| `render_timestamps` | boolean | No | Render timestamps on frames; requires `--font-file` (default: `false`) |
 | `skip_blank_frames` | boolean | No | Skip blank/solid frames (default: `false`) |
 | `job_id` | string | No | Custom job ID for progress tracking |
-| `force_fallback` | number | No | Force specific fallback level (0=seek, 1=keyframe, 2=sequential) |
+| `force_fallback` | number | No | Force a specific extraction tier (0=seek, 1=keyframe, 2=sequential) |
 | `thumb_w` | number | No | Width hint for frame extraction |
 | `thumb_h` | number | No | Height hint for frame extraction |
 
 #### Selection Modes
 
-**Uniform Mode** - Evenly spaced frames:
-```json
+**Uniform** - evenly spaced frames:
+```jsonc
 {
   "mode": "uniform",
   "frames": 25,
-  "start_offset": 10.0,  // seconds from start (optional)
-  "end_offset": 90.0     // seconds from end (optional)
+  "start_offset": 10.0,  // seconds skipped at the start (optional)
+  "end_offset": 90.0     // seconds skipped at the end (optional)
 }
 ```
 
-**Timestamps Mode** - Specific timestamps:
+**Timestamps** - explicit timestamps in seconds:
 ```json
 {
   "mode": "timestamps",
@@ -186,32 +189,32 @@ fetch('http://127.0.0.1:3000/make_collage', {
 
 #### Collage Modes
 
-**Grid Mode** - Uniform grid:
-```json
+**Grid**:
+```jsonc
 {
   "mode": "grid",
   "rows": 5,
   "cols": 5,
   "spacing": 2,           // pixels between cells (optional)
-  "margin": 2,            // pixels around grid (optional)
+  "margin": 2,            // pixels around the grid (optional)
   "width": 1440,          // output width (optional)
   "height": 1080,         // output height (optional)
-  "background": {         // background color (optional)
-    "r": 0, "g": 0, "b": 0, "a": 255
-  }
+  "background": {"r": 0, "g": 0, "b": 0, "a": 255}  // optional
 }
 ```
 
-**Advanced Mode** - Custom positions:
-```json
+If only `width` or only `height` is given, the other is derived from the video aspect ratio. If neither is given, the output is 1280x720.
+
+**Advanced** - custom positions as fractions of the output size:
+```jsonc
 {
   "mode": "advanced",
   "pieces": [
     {
-      "x_percent": 0.0,   // x position (0.0 to 1.0)
-      "y_percent": 0.0,   // y position (0.0 to 1.0)
-      "w_percent": 0.5,   // width (0.0 to 1.0)
-      "h_percent": 0.5    // height (0.0 to 1.0)
+      "x_percent": 0.0,   // 0.0 to 1.0
+      "y_percent": 0.0,
+      "w_percent": 0.5,
+      "h_percent": 0.5
     }
   ],
   "spacing": 5,
@@ -226,12 +229,10 @@ fetch('http://127.0.0.1:3000/make_collage', {
 
 - **Status**: `200 OK`
 - **Content-Type**: `image/jpeg`
-- **Header**: `X-Collage-Meta-B64` - Base64-encoded JSON metadata
-- **Body**: Assembled collage image as JPEG with embedded metadata in COM marker
+- **Header**: `X-Collage-Meta-B64` - base64-encoded JSON metadata
+- **Body**: Collage JPEG with the same metadata embedded in a COM marker
 
 #### Metadata Format
-
-The returned JPEG contains embedded metadata with both requested and actual timestamps:
 
 ```json
 {
@@ -256,21 +257,20 @@ The returned JPEG contains embedded metadata with both requested and actual time
 }
 ```
 
-**Note**: `timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped or fallback extraction is used.
+`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`.
 
 #### Error Responses
 
-- `429 Too Many Requests`: Max concurrent jobs reached
-- `500 Internal Server Error`: Processing error with JSON error details
+- `429 Too Many Requests`: all `--max-workers` slots are busy
+- `500 Internal Server Error`: processing error, body is `{"error": "..."}`
 
 ### Endpoint: `GET /ws-progress` (WebSocket)
 
-Real-time progress updates for active jobs (enabled with `--ws-progress` flag).
+Enabled with `--ws-progress`. Every connected client receives updates for all jobs; filter by `job_id`.
 
-**Progress Message Format**:
 ```json
 {
-  "job_id": "job-1728212345678-0",
+  "job_id": "job_1728212345678",
   "filename": "/videos/movie.mp4",
   "progress": 0.45,
   "fallback_level": 0,
@@ -278,14 +278,9 @@ Real-time progress updates for active jobs (enabled with `--ws-progress` flag).
 }
 ```
 
-**Fallback Levels**:
-- `0`: Seek mode (fast)
-- `1`: Keyframe-only GENPTS fallback (medium speed)
-- `2`: Sequential decode fallback (slow, most compatible)
+**Fallback levels**: `0` seek (fast), `1` keyframe-only, `2` sequential decode (slow, most compatible).
 
 ## Configuration
-
-### Command-Line Options
 
 ```
 Options:
@@ -293,7 +288,7 @@ Options:
   --max-workers <N>             Max concurrent jobs [default: CPU count]
   --font-file <PATH>            TTF font for timestamp overlays
   --jpeg-quality <1-100>        JPEG quality [default: 80]
-  --root-path <PATH>            Root path for video files
+  --root-path <PATH>            Base directory that request paths are joined to
   --no-path-meta                Exclude video path from metadata
   --allow-fallback <LEVEL>      Fallback extraction level [default: 2]
                                 0 = none (seek only)
@@ -308,92 +303,58 @@ Options:
 
 ### Environment Variables
 
-- `FFMPEG_DIR`: Path to FFmpeg installation (Windows only, for DLL copying)
+- `FFMPEG_DIR`: FFmpeg installation directory (Windows builds; DLLs are copied from its `bin` folder)
 
 ## Features in Detail
 
+### Multi-Tier Fallback
+
+1. **Seek** - seeks to each timestamp and decodes the next clean frame. If a seek lands on a non-keyframe (broken index), packets are skipped until the next keyframe. Any decode error aborts seek mode for the whole request.
+2. **Keyframe-only** - used when seek mode fails. Reopens the file with regenerated timestamps and decodes only keyframes in a single pass.
+3. **Sequential** - used when keyframe-only mode captures nothing. Decodes every frame; needed for formats like RealVideo.
+
+Failure handling per `--allow-fallback` level:
+
+| Level | Behavior | Fails when |
+|-------|----------|------------|
+| 0 | Seek only | more than 33% of frames fail |
+| 1 | Seek → keyframe-only | any frame is still missing |
+| 2 | Seek → keyframe-only → sequential | more than 20% of frames are missing |
+
 ### Blank Frame Detection
 
-When `skip_blank_frames: true` is set, the service:
-1. Calculates pixel variance using luminance sampling
-2. Frames with variance < 300 are considered "blank"
-3. Automatically retries 1.5 seconds forward (up to 3 retries)
-4. Updates metadata with actual timestamp used
+With `skip_blank_frames: true`, each extracted frame is sampled (every 8th pixel) and its luminance mean and variance computed. A frame is considered blank if:
 
-**Use case**: Skip intros/credits with solid black/white frames
+- variance < 500 (solid color), or
+- mean > 230 and variance < 3000 (near-white), or
+- mean < 25 and variance < 3000 (near-black)
 
-### Multi-Tier Fallback System
-
-Handles corrupted videos gracefully with automatic fallback:
-
-1. **Tier 1: Fast Seeking** - 10-100ms per frame for healthy videos
-2. **Tier 2: Keyframe Fallback** - Uses GENPTS timestamp regeneration, decodes only keyframes
-3. **Tier 3: Sequential Decode** - Decodes all frames, handles severely corrupted videos
-
-Fallback triggers when >33% of frames fail. Controlled by `--allow-fallback` level.
-
-### WebSocket Progress Monitoring
-
-Real-time progress updates via WebSocket:
-- Tracks current fallback level (seek/keyframe/sequential)
-- Shows extraction progress (0.0 to 1.0)
-- Provides status messages
-- Supports custom job IDs for tracking
-
-See `test_ws_progress_deno.ts` for a complete working example with:
-- Concurrent job limiting (5 max)
-- Visual progress bars with ANSI escape codes
-- Fallback level indicators (⚡/🔑/🐌)
-- Folder scanning and batch processing
+Blank frames trigger a seek 2.5 seconds forward, up to 10 times. The metadata records the timestamp that was actually used.
 
 ## Performance
 
-- **Concurrency**: Controlled by semaphore (default: CPU count)
-- **Memory**: One decoded frame per active job
-- **Speed**: 10-100x faster than naive sequential decoding
-- **Typical Frame Extraction**: 10-100ms per frame (seek mode)
-- **Example**: 25-frame collage from 2-hour video in ~0.5-2 seconds
+| Video Type | Tier Used | Typical Time | Example |
+|------------|-----------|--------------|---------|
+| Clean H.264/H.265 | Seek | 0.5-2s for 25 frames | Modern videos |
+| H.264 with corruption | Keyframe-only | 1-5s for 25 frames | Damaged downloads |
+| RealVideo (.rm) | Sequential | 30-180s for 25 frames | Old formats |
 
-### Performance by Fallback Level
+Concurrency is limited by `--max-workers`; memory use is roughly one decoded frame plus the output canvas per active job.
 
-| Video Type | Fallback Level | Typical Speed | Example |
-|------------|----------------|---------------|---------|
-| Clean H.264/H.265 | 0 (seek) | 0.5-2s for 25 frames | Modern videos |
-| H.264 with corruption | 1 (keyframe) | 1-5s for 25 frames | Damaged downloads |
-| RealVideo (.rm) | 2 (sequential) | 30-180s for 25 frames | Old formats |
-
-## Development
-
-### Building from Source
-
-```bash
-# Debug build
-cargo build
-
-# Release build with optimizations
-cargo build --release
-
-# Run with all features
-./target/release/thumbs-collage --ws-progress --font-file /path/to/arial.ttf
-```
-
-### Project Structure
+## Project Structure
 
 ```
-rust-thumbnail-service/
-├── src/
-│   └── main.rs                    # Main application code
-├── test_ws_progress_deno.ts       # Deno example client with progress
-├── test_ws_progress.js            # Node.js example client
-├── build.rs                       # Build script (FFmpeg DLL copying)
-├── Cargo.toml                     # Rust dependencies
-├── CLAUDE.md                      # Technical documentation
-└── README.md                      # This file
+├── src/main.rs                 # Service implementation
+├── build.rs                    # Copies FFmpeg DLLs on Windows
+├── test_ws_progress_deno.ts    # Example Deno client with progress bars
+├── .github/workflows/          # Release builds (Windows, Linux, macOS)
+├── CLAUDE.md                   # Implementation notes
+└── LICENSE
 ```
 
 ### Example Client
 
-Run the Deno example to process a folder of videos with progress monitoring:
+Processes a folder of videos with live progress (expects the server on `127.0.0.1:3000` with `--ws-progress`):
 
 ```bash
 deno run --allow-net --allow-read --allow-write \
@@ -402,39 +363,18 @@ deno run --allow-net --allow-read --allow-write \
   /path/to/output
 ```
 
-Features:
-- Recursive video file scanning
-- Concurrent processing (5 max)
-- Real-time progress bars
-- Fallback level indicators
-- Completion summaries
-
 ## Troubleshooting
 
-### Windows: "STATUS_DLL_NOT_FOUND" Error
+### Windows: `STATUS_DLL_NOT_FOUND`
 
-FFmpeg DLLs are missing. Solutions:
-
-1. Set `FFMPEG_DIR` environment variable and rebuild:
-   ```bash
-   set FFMPEG_DIR=C:\path\to\ffmpeg
-   cargo build
-   ```
-
-2. Or manually copy DLLs to executable directory:
-   - `avcodec-*.dll`
-   - `avformat-*.dll`
-   - `avutil-*.dll`
-   - `swscale-*.dll`
-   - `swresample-*.dll`
+The FFmpeg DLLs are not next to the executable. Either set `FFMPEG_DIR` and rebuild, or copy `avcodec-*.dll`, `avformat-*.dll`, `avutil-*.dll`, `swscale-*.dll` and `swresample-*.dll` next to `thumbs-collage.exe`.
 
 ### Linux: FFmpeg Library Not Found
 
-Install FFmpeg development libraries:
-
 ```bash
 # Ubuntu/Debian
-sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+sudo apt install clang pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+  libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
 
 # Fedora/RHEL
 sudo dnf install ffmpeg-devel
@@ -445,25 +385,23 @@ sudo pacman -S ffmpeg
 
 ### Timestamps Don't Match
 
-This is expected when `skip_blank_frames: true` or fallback extraction is used. Check metadata:
-- `timestamp_requested`: What you asked for
-- `timestamp_actual`: What was actually extracted
-
-The rendered timestamp shows the actual frame time.
+Expected when blank frames are skipped or fallback extraction is used. Compare `timestamp_requested` and `timestamp_actual` in the metadata; the rendered overlay shows the actual time.
 
 ## Known Limitations
 
-1. **Seek Accuracy**: Not frame-accurate for all codecs (grabs nearest keyframe)
-2. **Blank Detection**: Based on pixel variance, may not catch all visual blanks
-3. **Single Video**: One video per request
-4. **No Authentication**: Service has no built-in access control
-
-See `CLAUDE.md` for detailed technical documentation.
+1. **Seek accuracy**: not frame-accurate; seek mode returns the first clean frame after the nearest preceding keyframe.
+2. **Blank detection**: variance-based, so it can miss low-detail frames that aren't solid or flag very dark scenes.
+3. **One video per request**.
+4. **No access control**: the service opens whatever path it is given (`--root-path` is a base directory, not a sandbox), has no authentication, and broadcasts job file paths to every WebSocket client. Run it on localhost or behind something that controls access, for trusted callers only.
 
 ## License
 
-[Add your license here]
+Copyright (C) 2025-2026 tsukeero
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
+
+The Windows release archives bundle FFmpeg shared libraries built by [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) under the GPL. FFmpeg source is available from [ffmpeg.org](https://ffmpeg.org/download.html).
 
 ## Contributing
 
-[Add contribution guidelines here]
+Issues and pull requests are welcome. Please run `cargo build` and `cargo clippy` before submitting, and describe how you tested changes against real video files.

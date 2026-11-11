@@ -6,6 +6,9 @@ path = "src/main.rs"
 name = "thumbs-collage"
 version = "0.0.2"
 edition = "2021"
+description = "HTTP service that extracts video frames with FFmpeg and assembles them into thumbnail collages"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tsukeero/rust-video-thumbnail-generator"
 
 [dependencies]
 axum = { version = "0.6", features = ["ws"] }

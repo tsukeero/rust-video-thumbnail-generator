@@ -105,10 +105,27 @@ jobs:
           New-Item -ItemType Directory -Path $ARCHIVE
           Copy-Item "target\x86_64-pc-windows-msvc\release\thumbs-collage.exe" "$ARCHIVE\"
           Copy-Item "README.md" "$ARCHIVE\"
+          Copy-Item "LICENSE" "$ARCHIVE\"
 
-          # Copy FFmpeg DLLs
+          # Copy FFmpeg DLLs, plus FFmpeg's license and where its source lives (GPL)
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
           Copy-Item "$($ffmpegDir.FullName)\bin\*.dll" "$ARCHIVE\"
+          $ffmpegLicense = Get-ChildItem -Path $ffmpegDir.FullName -File -Filter "LICENSE*" | Select-Object -First 1
+          if (-not $ffmpegLicense) { throw "FFmpeg license file not found in $($ffmpegDir.FullName)" }
+          Copy-Item $ffmpegLicense.FullName "$ARCHIVE\FFMPEG-LICENSE.txt"
+          $ffmpegVersion = (& "$($ffmpegDir.FullName)\bin\ffmpeg.exe" -version | Select-Object -First 1)
+          @(
+            "The FFmpeg DLLs in this archive are an unmodified shared build from"
+            "https://github.com/BtbN/FFmpeg-Builds (ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip)."
+            ""
+            "Version: $ffmpegVersion"
+            ""
+            "FFmpeg is licensed under the GNU GPL; see FFMPEG-LICENSE.txt."
+            "Source code: https://github.com/FFmpeg/FFmpeg (the release/8.1 branch),"
+            "build scripts: https://github.com/BtbN/FFmpeg-Builds"
+            ""
+            "thumbs-collage source: https://github.com/${{ github.repository }}/tree/${{ needs.create-release.outputs.tag }}"
+          ) | Set-Content -Encoding utf8 "$ARCHIVE\FFMPEG-NOTICE.txt"
 
           Compress-Archive -Path $ARCHIVE -DestinationPath "${ARCHIVE}.zip"
 
@@ -155,7 +172,7 @@ jobs:
           ARCHIVE="thumbs-collage-${VERSION}-linux-x86_64"
           mkdir -p "$ARCHIVE"
           cp "target/x86_64-unknown-linux-gnu/release/thumbs-collage" "$ARCHIVE/"
-          cp "README.md" "$ARCHIVE/"
+          cp "README.md" "LICENSE" "$ARCHIVE/"
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
 
       - name: Upload Release Asset
@@ -194,7 +211,7 @@ jobs:
           ARCHIVE="thumbs-collage-${VERSION}-macos-aarch64"
           mkdir -p "$ARCHIVE"
           cp "target/aarch64-apple-darwin/release/thumbs-collage" "$ARCHIVE/"
-          cp "README.md" "$ARCHIVE/"
+          cp "README.md" "LICENSE" "$ARCHIVE/"
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
 
       - name: Upload Release Asset

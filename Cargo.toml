@@ -4,7 +4,7 @@ path = "src/main.rs"
 
 [package]
 name = "thumbs-collage"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "HTTP service that extracts video frames with FFmpeg and assembles them into thumbnail collages"
 license = "GPL-3.0-or-later"

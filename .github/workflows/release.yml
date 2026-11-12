@@ -137,7 +137,8 @@ jobs:
   build-linux:
     name: Build Linux
     needs: create-release
-    runs-on: ubuntu-latest
+    # Oldest available Ubuntu, so the binary needs as old a glibc as possible
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -149,21 +150,24 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - name: Install FFmpeg dependencies
+      - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            clang \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            libavfilter-dev \
-            libavdevice-dev \
-            libswscale-dev \
-            libswresample-dev \
-            pkg-config
+          sudo apt-get install -y clang
+
+      - name: Download and setup FFmpeg
+        run: |
+          # Same FFmpeg 8.1 shared build as Windows; its libraries are bundled with the binary
+          curl -sSfL -o ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
+          tar -xf ffmpeg.tar.xz
+          FFMPEG_DIR="$(find "$PWD" -maxdepth 1 -type d -name 'ffmpeg-*' | head -1)"
+          echo "FFMPEG_DIR=$FFMPEG_DIR" >> $GITHUB_ENV
 
       - name: Build
+        env:
+          # Look for the bundled FFmpeg libraries next to the binary. DT_RPATH (not RUNPATH)
+          # so it also applies to the FFmpeg libraries' dependencies on each other.
+          RUSTFLAGS: "-C link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN"
         run: cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Package
@@ -173,7 +177,36 @@ jobs:
           mkdir -p "$ARCHIVE"
           cp "target/x86_64-unknown-linux-gnu/release/thumbs-collage" "$ARCHIVE/"
           cp "README.md" "LICENSE" "$ARCHIVE/"
+
+          # FFmpeg shared libraries, plus FFmpeg's license and where its source lives (GPL)
+          cp -a "$FFMPEG_DIR"/lib/lib*.so.* "$ARCHIVE/"
+          cp "$FFMPEG_DIR/LICENSE.txt" "$ARCHIVE/FFMPEG-LICENSE.txt"
+          FFMPEG_VERSION="$(LD_LIBRARY_PATH="$FFMPEG_DIR/lib" "$FFMPEG_DIR/bin/ffmpeg" -version | head -1)"
+          cat > "$ARCHIVE/FFMPEG-NOTICE.txt" <<NOTICE
+          The FFmpeg libraries in this archive are an unmodified shared build from
+          https://github.com/BtbN/FFmpeg-Builds (ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz).
+
+          Version: ${FFMPEG_VERSION}
+
+          FFmpeg is licensed under the GNU GPL; see FFMPEG-LICENSE.txt.
+          Source code: https://github.com/FFmpeg/FFmpeg (the release/8.1 branch),
+          build scripts: https://github.com/BtbN/FFmpeg-Builds
+
+          thumbs-collage source: https://github.com/${{ github.repository }}/tree/${{ needs.create-release.outputs.tag }}
+          NOTICE
+
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
+
+      - name: Check the archive runs on its own
+        run: |
+          mkdir smoke && tar -xzf thumbs-collage-*-linux-x86_64.tar.gz -C smoke
+          BIN="$(realpath "$(find smoke -name thumbs-collage -type f)")"
+          ldd "$BIN"
+          if ldd "$BIN" | grep -q "not found"; then echo "missing libraries"; exit 1; fi
+          if ldd "$BIN" | grep -E 'lib(av|sw)' | grep -v "$(dirname "$BIN")"; then
+            echo "FFmpeg libraries resolved outside the archive"; exit 1
+          fi
+          "$BIN" --help > /dev/null
 
       - name: Upload Release Asset
         env:

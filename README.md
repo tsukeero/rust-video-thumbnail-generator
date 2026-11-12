@@ -18,7 +18,13 @@ A Rust HTTP service that extracts frames from videos and assembles them into thu
 
 ### Pre-built Binaries
 
-Windows, Linux and macOS (Apple Silicon) builds are available on the [Releases](https://github.com/tsukeero/rust-video-thumbnail-generator/releases) page. The Windows archive includes the FFmpeg DLLs; on Linux and macOS install FFmpeg 8.x shared libraries from your package manager.
+Builds are available on the [Releases](https://github.com/tsukeero/rust-video-thumbnail-generator/releases) page:
+
+- **Windows (x86_64)** and **Linux (x86_64)**: self-contained, the FFmpeg 8.1 libraries are included next to the binary. Keep them in the same folder. The Linux build needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later).
+- **macOS (Apple Silicon)**: needs Homebrew's FFmpeg 8 at its default location. Plain `ffmpeg` is now 9.x, which this build can't load:
+  ```bash
+  brew install ffmpeg@8
+  ```
 
 ### Building from Source
 

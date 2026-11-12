@@ -81,4 +81,9 @@ Triggered in `process_video` when more than a third of Tier 1 frames are `None` 
 
 ## Releases
 
-`.github/workflows/release.yml` is manual (`workflow_dispatch` with a version). It bumps `Cargo.toml`, tags, creates the GitHub release, and builds Windows x86_64 (BtbN FFmpeg 8.1 GPL shared, DLLs bundled), Linux x86_64 (distro FFmpeg dev packages), and macOS aarch64 (Homebrew `ffmpeg@8`, keg-only, via `PKG_CONFIG_PATH`).
+`.github/workflows/release.yml` is manual (`workflow_dispatch` with a version). It bumps `Cargo.toml`, tags, creates the GitHub release, and builds:
+- **Windows x86_64**: BtbN FFmpeg 8.1 GPL shared build, DLLs bundled next to the exe.
+- **Linux x86_64**: same BtbN build via `FFMPEG_DIR`, `.so` files bundled, binary linked with `-rpath,$ORIGIN` and `--disable-new-dtags` (DT_RPATH, so it also covers the FFmpeg libraries' dependencies on each other). Built on `ubuntu-22.04` to keep the glibc requirement low; a smoke step fails the job if `ldd` resolves FFmpeg outside the archive.
+- **macOS aarch64**: Homebrew `ffmpeg@8` (keg-only, via `PKG_CONFIG_PATH`), not bundled; the binary hard-codes `/opt/homebrew/opt/ffmpeg@8/lib`.
+
+Windows and Linux archives carry `FFMPEG-LICENSE.txt` and `FFMPEG-NOTICE.txt` (exact FFmpeg version and source links) for GPL compliance.

@@ -4,7 +4,7 @@ Implementation notes for working on this codebase. User-facing docs (API, CLI op
 
 ## Overview
 
-`thumbs-collage` is an HTTP service that extracts frames from a video at given timestamps and assembles them into a JPEG collage (grid or custom layout). Everything is in `src/main.rs`.
+`thumbs-collage` is an HTTP service that extracts frames from a video at given timestamps and assembles them into a JPEG collage (grid or custom layout, `POST /make_collage`), or returns them as separate images (`POST /frames`). Everything is in `src/main.rs`.
 
 - **Stack**: Axum 0.6 (HTTP + WebSocket), Tokio, `ffmpeg-next` 8.x, `image`/`imageproc`, `rusttype` for timestamp text, serde.
 - **FFmpeg**: must be 8.x. `ffmpeg-next` 8 does not build against FFmpeg 9 (Homebrew's default `ffmpeg` and BtbN's `master` builds are 9.x; CI pins 8.1).
@@ -17,17 +17,21 @@ cargo build --release                  # Linux/macOS: needs FFmpeg 8 dev libs, c
 set FFMPEG_DIR=C:\path\to\ffmpeg-8.x   # Windows: build.rs copies %FFMPEG_DIR%\bin\*.dll next to the exe
 ```
 
-There are no automated tests yet. Verify changes by running the server and POSTing to `/make_collage` against real files, including corrupt ones and AVI/RealVideo.
+There are no automated tests yet. Verify changes by running the server and POSTing to `/make_collage` and `/frames` against real files, including corrupt ones and AVI/RealVideo.
 
 ## Request Flow
 
-1. `make_collage` (async handler) takes a semaphore permit with `try_acquire_owned`; a full semaphore returns 429 immediately, no queueing.
-2. `process_video` runs in `spawn_blocking`: `resolve_paths` → `probe_duration` / `probe_dimensions` → compute timestamps → layout → extraction tiers → draw frames and timestamps on the canvas → encode JPEG → `insert_jpeg_com`.
-3. Metadata is returned twice: in a JPEG COM marker and base64 in the `X-Collage-Meta-B64` header. It includes the full request config (`selection`, `collage`, ...), so those types derive both `Serialize` and `Deserialize`.
+1. Both handlers go through `run_job`: it takes a semaphore permit with `try_acquire_owned` (a full semaphore returns 429 immediately, no queueing), runs the job in `spawn_blocking`, and maps errors with `job_error_response` (a `BadRequest` error is 400, anything else 500, message printed with `{:#}` so context chains show).
+2. Shared steps, used by both endpoints:
+   - `prepare`: `resolve_paths` → `probe_duration` / `probe_dimensions` → timestamps from the selection, in request order.
+   - `extract`: the extraction tiers and failure thresholds, for one `FrameTarget { w, h, fit }` per timestamp. Returns the frames plus `fallback_level`, the tier that produced them (0 seek, 1 keyframes, 2 sequential; `extract_frames_with_genpts` reports which of its passes succeeded).
+3. `/make_collage` → `process_video`: layout → targets from the rects (a timestamp without a rect gets `thumb_w`/`thumb_h` `.max(160)`/`.max(90)`) → `extract` → draw frames and timestamps on the canvas → encode JPEG → `insert_jpeg_com`. Metadata is returned twice: in a JPEG COM marker and base64 in the `X-Collage-Meta-B64` header. It includes the full request config (`selection`, `collage`, ...), so those types derive both `Serialize` and `Deserialize`.
+4. `/frames` → `validate_frames_request` (in the async handler, before a permit is taken) → `process_frames`: `frames_target` computes one target for all frames from `size` → `extract` → `finish_frame` (centre crop, only `cover` decodes larger than the output) → encode JPEG (with a per-frame COM marker) or PNG → base64 inline or written to `output.dir`. `WrittenFiles` deletes the job's files on drop unless the job completes.
+   - `FramesRequest`, `SizeSpec` and `OutputSpec` use `deny_unknown_fields` (422 on typos); `JobRequest` stays lenient. `OutputSpec::Inline {}` is an empty struct variant because serde ignores unknown fields on unit variants of internally tagged enums.
 
 ## Extraction Tiers
 
-All extractors return `Vec<Option<(DynamicImage, f64)>>`; the `f64` is the **actual** frame timestamp, which goes into the metadata as `timestamp_actual` and is what gets rendered.
+All extractors take `targets: &[FrameTarget]` (one per timestamp, passed to `decode_and_scale_frame`) and return `Vec<Option<(DynamicImage, f64)>>`; the `f64` is the **actual** frame timestamp, which goes into the metadata as `timestamp_actual` and is what gets rendered.
 
 ### Tier 1: `extract_frames_seek_each`
 One input context; for each timestamp `av_seek_frame(..., AVSEEK_FLAG_BACKWARD)` (raw FFI, the safe wrapper was unreliable), `decoder.flush()`, then `extract_frame_after_seek`.
@@ -40,13 +44,13 @@ One input context; for each timestamp `av_seek_frame(..., AVSEEK_FLAG_BACKWARD)`
 - **Blank retry** (when `skip_blank_frames`): `is_blank_image` → seek +2.5s, up to 10 retries.
 
 ### Tier 2/3: `extract_frames_with_genpts` → `extract_frames_sequential`
-Triggered in `process_video` when more than a third of Tier 1 frames are `None` (and `--allow-fallback` ≥ 1).
+Triggered in `extract` when more than a third of Tier 1 frames are `None` (and `--allow-fallback` ≥ 1).
 - `extract_frames_sequential` opens with `AVFMT_FLAG_GENPTS`, sorts timestamps, and decodes in one pass. FFmpeg logging is set to `Fatal` here to suppress corruption spam.
 - **Tier 2** calls it with `keyframes_only = true` (`AVDISCARD_NONKEY`), accepting only clean keyframes.
 - **Tier 3** (only if Tier 2 captured zero frames and `--allow-fallback 2`) decodes every frame. Accepts frames from 10s before to 45s after the target. Needed for RealVideo, where skipping non-keyframes breaks references.
 - Blank frames are checked with `is_blank_frame` (FFmpeg frame, stride-aware).
 
-### Failure thresholds (`process_video`)
+### Failure thresholds (`extract`)
 | `--allow-fallback` | Fails when |
 |---|---|
 | 0 | >33% of frames fail in seek mode |
@@ -76,6 +80,8 @@ Triggered in `process_video` when more than a third of Tier 1 frames are `None` 
 - **Default bind** is `127.0.0.1:0` (random port); the server prints `Listening on http://<addr>` so a parent process can parse the port.
 - **`--exit-on-stdin-close`**: `spawn_stdin_close_watcher` exits the process when stdin hits EOF/errors, so it dies with a parent that spawned it with a piped stdin.
 - **Paths**: `resolve_paths` simply joins `--root-path` with the request path. This is not a sandbox (absolute paths and `..` escape it, and FFmpeg accepts URLs). The service assumes trusted callers.
+- **Writing**: `/frames` with `output.mode: "files"` writes into any `output.dir` it is given (created with `create_dir_all`, not joined to `--root-path`). Same trusted-callers stance; `prefix` is only checked for path separators and `..`.
+- **stdout**: only the `Listening on` line goes to stdout; diagnostics go to stderr. A parent that stops reading a piped stdout would otherwise block the service once the pipe fills.
 - **`metadata_text`** is accepted in the request but unused.
 - **FFmpeg 8 API**: keyframe detection uses `flags & AV_FRAME_FLAG_KEY`, not the removed `key_frame` field.
 

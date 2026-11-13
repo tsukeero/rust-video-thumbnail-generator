@@ -1,6 +1,6 @@
 # Video Thumbnail Collage Service
 
-A Rust HTTP service that extracts frames from videos and assembles them into thumbnail collages. Built on FFmpeg for decoding and Axum for async HTTP.
+A Rust HTTP service that extracts frames from videos and assembles them into thumbnail collages, or returns them as separate images. Built on FFmpeg for decoding and Axum for async HTTP.
 
 ## Features
 
@@ -8,6 +8,7 @@ A Rust HTTP service that extracts frames from videos and assembles them into thu
 - 🛡️ **Corruption Handling**: Multi-tier fallback (seek → keyframe-only → full sequential decode) for damaged videos
 - 🎬 **Frame Selection**: Uniformly spaced frames or explicit timestamps
 - 🖼️ **Flexible Layouts**: Grid mode or custom percentage-based layouts
+- 🎞️ **Separate Frames**: `POST /frames` returns each frame as its own JPEG or PNG, inline or written to a folder
 - ⏱️ **Timestamp Overlays**: Optional timestamp rendering showing the actual extracted frame time
 - 📊 **Embedded Metadata**: JSON metadata in the JPEG COM marker and an HTTP header
 - 🎨 **Fit Modes**: Cover, contain, or stretch
@@ -252,6 +253,7 @@ If only `width` or only `height` is given, the other is derived from the video a
       "rect": {"x": 10, "y": 10, "w": 280, "h": 210}
     }
   ],
+  "fallback_level": 0,
   "config": {
     "selection": {"mode": "uniform", "frames": 25},
     "collage": {"mode": "grid", "rows": 5, "cols": 5},
@@ -263,12 +265,93 @@ If only `width` or only `height` is given, the other is derived from the video a
 }
 ```
 
-`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`.
+`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`. `fallback_level` is the extraction tier that produced the frames (see [Multi-Tier Fallback](#multi-tier-fallback)).
 
 #### Error Responses
 
 - `429 Too Many Requests`: all `--max-workers` slots are busy
 - `500 Internal Server Error`: processing error, body is `{"error": "..."}`
+
+### Endpoint: `POST /frames`
+
+The same frame extraction as `/make_collage` (selection, blank-frame skipping, fallback tiers and failure thresholds), but each frame comes back as its own image instead of a collage.
+
+```json
+{
+  "path": "/videos/movie.mp4",
+  "selection": { "mode": "timestamps", "timestamps": [12.5, 80.0, 141.2] },
+  "size": { "width": 480, "height": 270, "fit": "cover" },
+  "format": "jpeg",
+  "quality": 85,
+  "output": { "mode": "files", "dir": "/thumbs/movie.frames", "prefix": "frame_" },
+  "skip_blank_frames": true
+}
+```
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `path` | string | Yes | As in `/make_collage` |
+| `selection` | object | Yes | As in `/make_collage`; must yield at least one timestamp |
+| `size` | object | No | `{ width?, height?, fit? }`, see below (default: the source size) |
+| `format` | string | No | `"jpeg"` or `"png"` (default: `"jpeg"`) |
+| `quality` | number | No | JPEG quality 1-100 (default: `--jpeg-quality`); refused with `png` |
+| `output` | object | No | `{"mode": "inline"}` (default) or `{"mode": "files", "dir": "...", "prefix": "frame_"}` |
+| `skip_blank_frames` | boolean | No | As in `/make_collage` (default: `false`) |
+| `force_fallback` | number | No | As in `/make_collage` |
+| `job_id` | string | No | Custom job ID for progress tracking |
+
+Unknown fields are refused (422), so a typo doesn't pass silently. Timestamps keep their request order; duplicates are allowed.
+
+**Size**: every frame of a job gets the same size.
+
+| Given | Result |
+|-------|--------|
+| neither side | the source's decoded size |
+| `width` or `height` only | the other side from the video's aspect ratio |
+| both, `fit: "contain"` (default) | the largest size with the video's aspect inside the box |
+| both, `fit: "cover"` | exactly `width` x `height`, scaled and centre-cropped |
+| both, `fit: "stretch"` | exactly `width` x `height`, distorted |
+
+**Output**:
+- `inline`: each image is base64 in the reply (`data`). The whole reply is held in memory, so keep counts small.
+- `files`: images are written to `dir` (created if missing; not joined to `--root-path`) as `{prefix}{index}.jpg|png`, the index zero-padded to at least 3 digits (`frame_007.jpg`). Existing files with those names are overwritten; other files are left alone. If the job fails, the files it wrote are deleted. `prefix` may not contain a path separator or `..`.
+
+Each JPEG carries a COM marker with `{video, duration, index, timestamp_requested, timestamp_actual}`. PNG frames carry no metadata.
+
+#### Response
+
+`200 OK`, `application/json`:
+
+```json
+{
+  "video": "/videos/movie.mp4",
+  "duration": 1621.12,
+  "source": { "w": 1024, "h": 576 },
+  "size": { "w": 480, "h": 270 },
+  "format": "jpeg",
+  "fallback_level": 0,
+  "frames": [
+    { "index": 0, "timestamp_requested": 12.5, "timestamp_actual": 12.47, "file": "/thumbs/movie.frames/frame_000.jpg" },
+    null,
+    { "index": 2, "timestamp_requested": 141.2, "timestamp_actual": 141.17, "file": "/thumbs/movie.frames/frame_002.jpg" }
+  ],
+  "generated_at": "2026-11-13T10:00:00Z",
+  "config": { "selection": {}, "size": {}, "format": "jpeg", "quality": 85, "output": {}, "skip_blank_frames": true, "force_fallback": null }
+}
+```
+
+- `frames[i]` is `null` when frame `i` couldn't be decoded (within the `--allow-fallback` thresholds; beyond them the job fails).
+- In inline mode each frame has `data` (base64) instead of `file`.
+- `video` is omitted with `--no-path-meta`.
+
+#### Error Responses
+
+- `400 Bad Request`: invalid request (empty selection, `quality` with `png`, `width`/`height` of 0, missing `output.dir`, bad `prefix`, `force_fallback` above 2), body is `{"error": "..."}`
+- `422 Unprocessable Entity`: malformed JSON or an unknown field
+- `429 Too Many Requests`: all `--max-workers` slots are busy
+- `500 Internal Server Error`: probe, decode or write failure, or too many frames failed, body is `{"error": "..."}`
 
 ### Endpoint: `GET /ws-progress` (WebSocket)
 
@@ -398,7 +481,7 @@ Expected when blank frames are skipped or fallback extraction is used. Compare `
 1. **Seek accuracy**: not frame-accurate; seek mode returns the first clean frame after the nearest preceding keyframe.
 2. **Blank detection**: variance-based, so it can miss low-detail frames that aren't solid or flag very dark scenes.
 3. **One video per request**.
-4. **No access control**: the service opens whatever path it is given (`--root-path` is a base directory, not a sandbox), has no authentication, and broadcasts job file paths to every WebSocket client. Run it on localhost or behind something that controls access, for trusted callers only.
+4. **No access control**: the service opens whatever path it is given (`--root-path` is a base directory, not a sandbox), has no authentication, and broadcasts job file paths to every WebSocket client. `/frames` with `output.mode: "files"` also **writes** to any folder it is given. Run it on localhost or behind something that controls access, for trusted callers only; don't bind it to a public interface.
 
 ## License
 

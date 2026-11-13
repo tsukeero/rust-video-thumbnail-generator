@@ -17,6 +17,9 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio::time::{Duration, Instant};
 use futures::{StreamExt, SinkExt};
 
+mod scenes;
+mod scene_frames;
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Bind address, e.g. 0.0.0.0:3000 or 127.0.0.1:0 for random port
@@ -328,6 +331,17 @@ fn bad_request<T>(msg: impl Into<String>) -> Result<T> {
     Err(BadRequest(msg.into()).into())
 }
 
+/// A valid request the video can't serve (e.g. `keyframes` on an index that flags every
+/// packet): answered with 422
+#[derive(Debug)]
+struct Unprocessable(String);
+
+impl std::fmt::Display for Unprocessable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for Unprocessable {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -369,7 +383,8 @@ async fn main() -> Result<()> {
 
     let mut app = Router::new()
         .route("/make_collage", post(make_collage))
-        .route("/frames", post(frames));
+        .route("/frames", post(frames))
+        .route("/scenes", post(scenes_handler));
 
     // Add WebSocket endpoint if enabled
     if args.ws_progress {
@@ -443,7 +458,13 @@ fn error_response(status: StatusCode, msg: String) -> Response {
 /// Map a job error to a response: validation errors are 400, everything else 500.
 /// `{:#}` prints the context chain (e.g. "cannot write X: Access is denied").
 fn job_error_response(e: anyhow::Error) -> Response {
-    let status = if e.is::<BadRequest>() { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR };
+    let status = if e.is::<BadRequest>() {
+        StatusCode::BAD_REQUEST
+    } else if e.is::<Unprocessable>() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
     error_response(status, format!("{:#}", e))
 }
 
@@ -497,6 +518,19 @@ async fn make_collage(State(state): State<AppState>, Json(req): Json<JobRequest>
     }
 
     (headers, Bytes::from(collage_jpeg)).into_response()
+}
+
+/// HTTP handler for `POST /scenes`
+async fn scenes_handler(State(state): State<AppState>, Json(req): Json<scenes::ScenesRequest>) -> Response {
+    // Validate before taking a worker, so a bad request never occupies one
+    if let Err(e) = scenes::validate_request(&req) {
+        return job_error_response(e);
+    }
+    let job_id = job_id_or_new(&req.job_id);
+    match run_job(&state, move |st| scenes::process_scenes(&req, &st, job_id)).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// HTTP handler for `POST /frames`
@@ -845,25 +879,88 @@ fn validate_frames_request(req: &FramesRequest) -> Result<()> {
     if req.size.width == Some(0) || req.size.height == Some(0) {
         return bad_request("size: width and height must be at least 1");
     }
-    match (req.format, req.quality) {
-        (ImageFormat::Png, Some(_)) => return bad_request("quality applies to jpeg only"),
-        (_, Some(q)) if !(1..=100).contains(&q) => return bad_request("quality must be 1-100"),
-        _ => {}
-    }
     if let Some(level) = req.force_fallback {
         if level > 2 { return bad_request("force_fallback must be 0, 1 or 2"); }
     }
-    if let OutputSpec::Files { dir, prefix } = &req.output {
+    validate_output(req.format, req.quality, &req.output, "")
+}
+
+/// Checks on `format`, `quality` and `output`, shared by `/frames` and `/scenes`.
+/// `field_prefix` names where the fields sit in the request (e.g. "frames.").
+fn validate_output(format: ImageFormat, quality: Option<u8>, output: &OutputSpec, field_prefix: &str) -> Result<()> {
+    match (format, quality) {
+        (ImageFormat::Png, Some(_)) => return bad_request(format!("{}quality applies to jpeg only", field_prefix)),
+        (_, Some(q)) if !(1..=100).contains(&q) => return bad_request(format!("{}quality must be 1-100", field_prefix)),
+        _ => {}
+    }
+    if let OutputSpec::Files { dir, prefix } = output {
         if dir.as_deref().map_or(true, str::is_empty) {
-            return bad_request("output.dir is required with output.mode \"files\"");
+            return bad_request(format!("{}output.dir is required with output.mode \"files\"", field_prefix));
         }
         if let Some(p) = prefix {
             if p.contains('/') || p.contains('\\') || p.contains("..") {
-                return bad_request("output.prefix must not contain a path separator or \"..\"");
+                return bad_request(format!("{}output.prefix must not contain a path separator or \"..\"", field_prefix));
             }
         }
     }
     Ok(())
+}
+
+/// Encode one output frame: JPEG (without its COM marker; `deliver_frames` adds it) or PNG
+fn encode_frame(img: &DynamicImage, format: ImageFormat, quality: Option<u8>) -> Result<Vec<u8>> {
+    let rgb = DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut buf: Vec<u8> = Vec::new();
+    match format {
+        ImageFormat::Jpeg => rgb.write_to(&mut std::io::Cursor::new(&mut buf), ImageOutputFormat::Jpeg(quality.unwrap_or(80)))?,
+        ImageFormat::Png => rgb.write_to(&mut std::io::Cursor::new(&mut buf), ImageOutputFormat::Png)?,
+    }
+    Ok(buf)
+}
+
+/// An encoded output frame: its bytes, its entry in the reply, and (JPEG only) the JSON for its
+/// COM marker
+struct EncodedFrame { bytes: Vec<u8>, meta: serde_json::Value, com: Option<serde_json::Value> }
+
+/// Deliver encoded frames as `output` says: base64 `data` in each entry (inline), or files
+/// `{prefix}{index}.{ext}` in `output.dir`, the index zero-padded to at least `min_digits`.
+/// Files written are deleted again if a later one fails. `None` entries stay `null`.
+fn deliver_frames(frames: Vec<Option<EncodedFrame>>, output: &OutputSpec, format: ImageFormat, min_digits: usize) -> Result<Vec<serde_json::Value>> {
+    let files_out = match output {
+        OutputSpec::Files { dir, prefix } => {
+            let dir = PathBuf::from(dir.as_deref().unwrap_or_default());
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("cannot create output dir {}", dir.display()))?;
+            Some((dir, prefix.clone().unwrap_or_else(|| DEFAULT_FRAME_PREFIX.to_string())))
+        }
+        OutputSpec::Inline {} => None,
+    };
+    let digits = (frames.len().saturating_sub(1).to_string().len()).max(min_digits);
+    let mut written = WrittenFiles { paths: Vec::new(), keep: false };
+    let mut out = Vec::with_capacity(frames.len());
+    for (i, frame) in frames.into_iter().enumerate() {
+        let Some(EncodedFrame { bytes, mut meta, com }) = frame else {
+            out.push(serde_json::Value::Null);
+            continue;
+        };
+        let bytes = match com {
+            Some(com) => insert_jpeg_com(&bytes, &serde_json::to_vec(&com)?)?,
+            None => bytes,
+        };
+        match &files_out {
+            Some((dir, prefix)) => {
+                let file = dir.join(format!("{}{:0width$}.{}", prefix, i, format.extension(), width = digits));
+                std::fs::write(&file, &bytes).with_context(|| format!("cannot write {}", file.display()))?;
+                meta["file"] = serde_json::json!(file.to_string_lossy());
+                written.paths.push(file);
+            }
+            None => {
+                meta["data"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            }
+        }
+        out.push(meta);
+    }
+    written.keep = true;
+    Ok(out)
 }
 
 /// The output size of every frame of a `/frames` job, and the target the extractors decode to.
@@ -942,64 +1039,34 @@ fn process_frames(req: &FramesRequest, state: &AppState, job_id: String) -> Resu
         ImageFormat::Jpeg => Some(req.quality.unwrap_or(state.jpeg_quality)),
         ImageFormat::Png => None,
     };
-    let files_out = match &req.output {
-        OutputSpec::Files { dir, prefix } => {
-            let dir = PathBuf::from(dir.as_deref().unwrap_or_default());
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("cannot create output dir {}", dir.display()))?;
-            Some((dir, prefix.clone().unwrap_or_else(|| DEFAULT_FRAME_PREFIX.to_string())))
-        }
-        OutputSpec::Inline {} => None,
-    };
-    let digits = (count.saturating_sub(1).to_string().len()).max(3);
-    let mut written = WrittenFiles { paths: Vec::new(), keep: false };
-
-    let mut frames_meta = Vec::with_capacity(count);
+    let mut encoded = Vec::with_capacity(count);
     for (i, frame) in extracted.frames.iter().enumerate() {
         let Some((img, actual_ts)) = frame else {
-            frames_meta.push(serde_json::Value::Null);
+            encoded.push(None);
             continue;
         };
         let requested_ts = prep.timestamps[i];
-        let rgb = DynamicImage::ImageRgb8(finish_frame(img, target).to_rgb8());
-
-        let mut buf: Vec<u8> = Vec::new();
-        match quality {
-            Some(q) => {
-                rgb.write_to(&mut std::io::Cursor::new(&mut buf), ImageOutputFormat::Jpeg(q))?;
-                let mut com = serde_json::json!({
-                    "duration": prep.duration,
-                    "index": i,
-                    "timestamp_requested": requested_ts,
-                    "timestamp_actual": actual_ts,
-                });
-                if let Some(p) = &prep.meta_path {
-                    com["video"] = serde_json::json!(p);
-                }
-                buf = insert_jpeg_com(&buf, &serde_json::to_vec(&com)?)?;
+        let bytes = encode_frame(&finish_frame(img, target), req.format, quality)?;
+        let com = quality.map(|_| {
+            let mut com = serde_json::json!({
+                "duration": prep.duration,
+                "index": i,
+                "timestamp_requested": requested_ts,
+                "timestamp_actual": actual_ts,
+            });
+            if let Some(p) = &prep.meta_path {
+                com["video"] = serde_json::json!(p);
             }
-            None => rgb.write_to(&mut std::io::Cursor::new(&mut buf), ImageOutputFormat::Png)?,
-        }
-
-        let mut meta = serde_json::json!({
+            com
+        });
+        let meta = serde_json::json!({
             "index": i,
             "timestamp_requested": requested_ts,
             "timestamp_actual": actual_ts,
         });
-        match &files_out {
-            Some((dir, prefix)) => {
-                let file = dir.join(format!("{}{:0width$}.{}", prefix, i, req.format.extension(), width = digits));
-                std::fs::write(&file, &buf).with_context(|| format!("cannot write {}", file.display()))?;
-                meta["file"] = serde_json::json!(file.to_string_lossy());
-                written.paths.push(file);
-            }
-            None => {
-                meta["data"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&buf));
-            }
-        }
-        frames_meta.push(meta);
+        encoded.push(Some(EncodedFrame { bytes, meta, com }));
     }
-    written.keep = true;
+    let frames_meta = deliver_frames(encoded, &req.output, req.format, 3)?;
 
     let mut reply = serde_json::json!({
         "duration": prep.duration,

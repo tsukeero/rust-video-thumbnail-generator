@@ -4,7 +4,7 @@ Implementation notes for working on this codebase. User-facing docs (API, CLI op
 
 ## Overview
 
-`thumbs-collage` is an HTTP service that extracts frames from a video at given timestamps and assembles them into a JPEG collage (grid or custom layout, `POST /make_collage`), or returns them as separate images (`POST /frames`). Everything is in `src/main.rs`.
+`thumbs-collage` is an HTTP service that extracts frames from a video at given timestamps and assembles them into a JPEG collage (grid or custom layout, `POST /make_collage`), returns them as separate images (`POST /frames`), or detects scene cuts (`POST /scenes`). Collage and frames code is in `src/main.rs`; scene detection is in `src/scenes.rs` (detectors, hints, adaptive layer, flash filter, the job) and `src/scene_frames.rs` (frame placement, candidates, trimming).
 
 - **Stack**: Axum 0.6 (HTTP + WebSocket), Tokio, `ffmpeg-next` 8.x, `image`/`imageproc`, `rusttype` for timestamp text, serde.
 - **FFmpeg**: must be 8.x. `ffmpeg-next` 8 does not build against FFmpeg 9 (Homebrew's default `ffmpeg` and BtbN's `master` builds are 9.x; CI pins 8.1).
@@ -17,7 +17,7 @@ cargo build --release                  # Linux/macOS: needs FFmpeg 8 dev libs, c
 set FFMPEG_DIR=C:\path\to\ffmpeg-8.x   # Windows: build.rs copies %FFMPEG_DIR%\bin\*.dll next to the exe
 ```
 
-There are no automated tests yet. Verify changes by running the server and POSTing to `/make_collage` and `/frames` against real files, including corrupt ones and AVI/RealVideo.
+`cargo test` runs unit tests for scene detection (flash filter and adaptive reference values from the labelled-set replay, HSV against OpenCV, hint resolution, placement and trimming) and a synthetic-clip test that generates clips with known cuts through the FFmpeg CLI (`FFMPEG_DIR\bin` or PATH; skipped when there is none). Everything else is verified by running the server and POSTing to the endpoints against real files, including corrupt ones and AVI/RealVideo.
 
 ## Request Flow
 
@@ -28,6 +28,13 @@ There are no automated tests yet. Verify changes by running the server and POSTi
 3. `/make_collage` → `process_video`: layout → targets from the rects (a timestamp without a rect gets `thumb_w`/`thumb_h` `.max(160)`/`.max(90)`) → `extract` → draw frames and timestamps on the canvas → encode JPEG → `insert_jpeg_com`. Metadata is returned twice: in a JPEG COM marker and base64 in the `X-Collage-Meta-B64` header. It includes the full request config (`selection`, `collage`, ...), so those types derive both `Serialize` and `Deserialize`.
 4. `/frames` → `validate_frames_request` (in the async handler, before a permit is taken) → `process_frames`: `frames_target` computes one target for all frames from `size` → `extract` → `finish_frame` (centre crop, only `cover` decodes larger than the output) → encode JPEG (with a per-frame COM marker) or PNG → base64 inline or written to `output.dir`. `WrittenFiles` deletes the job's files on drop unless the job completes.
    - `FramesRequest`, `SizeSpec` and `OutputSpec` use `deny_unknown_fields` (422 on typos); `JobRequest` stays lenient. `OutputSpec::Inline {}` is an empty struct variant because serde ignores unknown fields on unit variants of internally tagged enums.
+   - `validate_output`, `encode_frame` and `deliver_frames` (base64 or files, `WrittenFiles` cleanup, COM marker added at delivery) are shared with `/scenes`.
+5. `/scenes` → `scenes::validate_request` (before the permit) → `scenes::process_scenes`:
+   - `resolve` merges the `hint`'s defaults under explicit fields and refuses fields the detector doesn't use (400). `adaptive` is `Option<Option<_>>` (absent / `null` / object) via the `present` deserializer.
+   - `keyframes`: `detect_keyframes` reads packet flags only; more than 50% keys → `Unprocessable` (422). With `frames`, placement and trimming run first, then the shared `extract` (seek tiers) fetches the targets.
+   - `scdet` / `content`: `detect_decoded` is one sequential GENPTS pass with frame-threaded decoding (drained with `send_eof`), each frame scaled to the analysis size (256 px wide, `analysis_size`): YUV420P bicubic for `scdet` (luma plane only, as FFmpeg's `scdet` does on planar YUV, so it matches `scale=256:-2,scdet`), for `content`, bilinear to YUV444P then converted to RGB24 at the small size (swscale's direct scale-to-RGB24 was the bottleneck), then OpenCV's fixed-point BGR2HSV in `HsvTables`. Errored frames get no score. Fails if fewer frames decode than half the video packets (not duration × frame rate: AVI's `avg_frame_rate`/`nb_frames` can be 5× off).
+   - `CutPipeline` = cut test (threshold, or the adaptive ratio over a ±window buffer, judged `window` frames late; edge frames count as below) → `FlashFilter` (PySceneDetect's merge/suppress with the length in seconds; `off` = suppress). It reproduces the labelled-set replay (`evalx.py`) exactly.
+   - Frames: `scene_frames::Collector` keeps candidates on an `every/4` grid while a scene is open (halving density beyond 8 × `max_per_scene`); when a new cut appears in `pipeline.cuts` it picks the nearest candidate per placed target and encodes it. Then `trim` (per-scene counts), `thin` (which picks to keep), and `deliver_frames` with 4-digit names.
 
 ## Extraction Tiers
 
@@ -92,4 +99,4 @@ Triggered in `extract` when more than a third of Tier 1 frames are `None` (and `
 - **Linux x86_64**: same BtbN build via `FFMPEG_DIR`, `.so` files bundled, binary linked with `-rpath,$ORIGIN` and `--disable-new-dtags` (DT_RPATH, so it also covers the FFmpeg libraries' dependencies on each other). Built on `ubuntu-22.04` to keep the glibc requirement low; a smoke step fails the job if `ldd` resolves FFmpeg outside the archive.
 - **macOS aarch64**: Homebrew `ffmpeg@8` (keg-only, via `PKG_CONFIG_PATH`), not bundled; the binary hard-codes `/opt/homebrew/opt/ffmpeg@8/lib`.
 
-Windows and Linux archives carry `FFMPEG-LICENSE.txt` and `FFMPEG-NOTICE.txt` (exact FFmpeg version and source links) for GPL compliance.
+Windows and Linux archives carry `FFMPEG-LICENSE.txt` and `FFMPEG-NOTICE.txt` (exact FFmpeg version and source links) for GPL compliance. All archives carry `PYSCENEDETECT-LICENSE.txt`: the BSD-3 notice for the code ported into `src/scenes.rs`.

@@ -1,0 +1,34 @@
+{
+  "_comment": "Synthetic clips for the scene detection goldens. Each is generated with `ffmpeg -filter_complex <graph> -c:v ffv1 -pix_fmt yuv444p <name>.mkv`: 256x144 (no analysis downscale in either tool), 25 fps, lossless. scripts/make_goldens.py runs PySceneDetect on them; the Rust tests regenerate them and compare.",
+  "fps": 25,
+  "clips": [
+    {
+      "name": "hard_cuts",
+      "graph": "testsrc2=size=256x144:rate=25:duration=3[a];smptebars=size=256x144:rate=25:duration=3[b];mandelbrot=size=256x144:rate=25,trim=duration=3,setpts=PTS-STARTPTS[c];cellauto=size=256x144:rate=25:rule=110:seed=7,trim=duration=3,setpts=PTS-STARTPTS[d];[a][b][c][d]concat=n=4:v=1:a=0,format=yuv444p"
+    },
+    {
+      "name": "flash",
+      "graph": "testsrc2=size=256x144:rate=25:duration=6[a];color=c=white:size=256x144:rate=25:duration=6[w];[a][w]overlay=enable='between(n,60,61)+between(n,100,100)',format=yuv444p"
+    },
+    {
+      "name": "fade",
+      "graph": "testsrc2=size=256x144:rate=25:duration=3,fade=t=out:st=2:d=1[a];smptebars=size=256x144:rate=25:duration=3,fade=t=in:st=0:d=1[b];[a][b]concat=n=2:v=1:a=0,format=yuv444p"
+    },
+    {
+      "name": "noise_motion",
+      "graph": "color=c=0x606060:size=256x144:rate=25:duration=3,noise=alls=40:allf=t:all_seed=11[a];testsrc2=size=256x144:rate=25:duration=3,noise=alls=20:allf=t:all_seed=12[b];[a][b]concat=n=2:v=1:a=0,format=yuv444p"
+    },
+    {
+      "name": "held_frames",
+      "graph": "testsrc2=size=256x144:rate=25:duration=4,fps=25/3,fps=25[a];smptehdbars=size=256x144:rate=25:duration=2,fps=25/3,fps=25[b];[a][b]concat=n=2:v=1:a=0,format=yuv444p"
+    },
+    {
+      "name": "dark",
+      "graph": "testsrc2=size=256x144:rate=25:duration=3,eq=brightness=-0.42[a];mandelbrot=size=256x144:rate=25,trim=duration=3,setpts=PTS-STARTPTS,eq=brightness=-0.42[b];[a][b]concat=n=2:v=1:a=0,format=yuv444p"
+    },
+    {
+      "name": "fast_cuts",
+      "graph": "testsrc2=size=256x144:rate=25:duration=0.4[a];smptebars=size=256x144:rate=25:duration=0.4[b];mandelbrot=size=256x144:rate=25,trim=duration=0.4,setpts=PTS-STARTPTS[c];testsrc2=size=256x144:rate=25:duration=2.4[d];smptebars=size=256x144:rate=25:duration=2[e];[a][b][c][d][e]concat=n=5:v=1:a=0,format=yuv444p"
+    }
+  ]
+}

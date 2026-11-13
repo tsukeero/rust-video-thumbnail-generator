@@ -17,7 +17,7 @@ cargo build --release                  # Linux/macOS: needs FFmpeg 8 dev libs, c
 set FFMPEG_DIR=C:\path\to\ffmpeg-8.x   # Windows: build.rs copies %FFMPEG_DIR%\bin\*.dll next to the exe
 ```
 
-`cargo test` runs unit tests for scene detection (flash filter and adaptive reference values from the labelled-set replay, HSV against OpenCV, hint resolution, placement and trimming) and a synthetic-clip test that generates clips with known cuts through the FFmpeg CLI (`FFMPEG_DIR\bin` or PATH; skipped when there is none). Everything else is verified by running the server and POSTing to the endpoints against real files, including corrupt ones and AVI/RealVideo.
+`cargo test` runs unit tests for scene detection (flash filter and adaptive reference values from the labelled-set replay, HSV against OpenCV, hint resolution, placement and trimming) a synthetic-clip test with known cuts, and the goldens: the clips described in `tests/golden/clips.json` are regenerated (lossless FFV1, 256x144, so neither tool downscales) and compared with PySceneDetect 0.7.3's output in `tests/golden/content.json` (per-frame `content_val`, adaptive ratio, cuts; currently exact) and with `ffmpeg ... scdet` run at test time. Both need the FFmpeg CLI (`FFMPEG_DIR\bin` or PATH) and are skipped without it. Regenerate `content.json` with `scripts/make_goldens.py` (Python + `scenedetect==0.7.3`, by hand) whenever `clips.json` changes. No real videos are in the repo; the F1 check on the labelled set lives outside it, with the labels. Everything else is verified by running the server and POSTing to the endpoints against real files, including corrupt ones and AVI/RealVideo.
 
 ## Request Flow
 

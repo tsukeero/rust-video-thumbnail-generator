@@ -463,7 +463,8 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 }
 ```
 
-- `scenes` is always present. Times are in seconds, `end` is exclusive, and the last `end` is `duration`.
+- `scenes` is always present. Times are in seconds from the start of the video (its first timestamp, so MPEG-TS and VOB files start at 0 too, as in every endpoint), `end` is exclusive, and the last `end` is `duration`.
+- `duration` comes from the headers, or, when they have none, from where the detection pass saw the video end (streams written to a pipe, raw elementary streams, truncated files). Unlike `/make_collage` and `/frames`, `/scenes` needs neither a header duration nor a video longer than 1 s.
 - `frames`, `size` and `format` are present only when frames were requested; inline mode puts `data` (base64) in place of `file`.
 - `scores` (with `return_scores`): `{ "t": [...], "score": [...], "ratio": [...] }`, one entry per scored frame; `ratio` only with `adaptive`.
 - `config` holds the resolved settings, the hint's defaults filled in.
@@ -579,6 +580,10 @@ deno run --allow-net --allow-read --allow-write \
 ```
 
 ## Troubleshooting
+
+### Timestamp jumps inside a file (known limitation)
+
+Times are counted from the video's first timestamp, which handles files that don't start at 0 (MPEG-TS, VOB). Files whose timestamps *jump* partway through are not handled: DVD rips that join several cells, or spliced TV recordings. On such a file the header duration covers only part of the video, and frames or scenes past the jump come back at the wrong time or are missing. Remuxing the file (`ffmpeg -fflags +genpts -i in.vob -c copy out.mkv`) usually gives it continuous timestamps.
 
 ### Windows: `STATUS_DLL_NOT_FOUND`
 

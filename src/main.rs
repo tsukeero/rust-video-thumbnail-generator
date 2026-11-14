@@ -1122,20 +1122,61 @@ fn insert_jpeg_com(jpeg: &[u8], comment: &[u8]) -> Result<Vec<u8>> {
 
 /// Probe duration (seconds). Uses stream duration if available, otherwise container duration.
 fn probe_duration(path: &str) -> Result<f64> {
+    probe_duration_opt(path)?.ok_or_else(|| anyhow::anyhow!("could not determine duration"))
+}
+
+/// The duration from the headers: the video stream's, else the container's. `None` when
+/// neither is set (a broken or truncated file); an error only if the file can't be opened or
+/// has no video stream.
+fn probe_duration_opt(path: &str) -> Result<Option<f64>> {
     let ictx = ffmpeg::format::input(&path)?;
     let stream = ictx.streams().best(ffmpeg::media::Type::Video).ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     if stream.duration() > 0 {
         let tb = stream.time_base();
-        let dur = stream.duration() as f64 * (tb.0 as f64 / tb.1 as f64);
-        Ok(dur)
-    } else {
-        let dur = ictx.duration();
-        if dur > 0 {
-            // container duration is in AV_TIME_BASE (microseconds)
-            Ok((dur as f64) / (ffmpeg_next::ffi::AV_TIME_BASE as f64))
+        return Ok(Some(stream.duration() as f64 * (tb.0 as f64 / tb.1 as f64)));
+    }
+    let dur = ictx.duration();
+    // container duration is in AV_TIME_BASE (microseconds)
+    Ok((dur > 0).then(|| dur as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64))
+}
+
+/// A video stream's clock: its time base and the timestamp of its start. Every time the service
+/// reports or seeks to is relative to that start, so a video starts at 0 even when its
+/// timestamps don't (MPEG-TS/PS start at 1.4 s or at a broadcast clock's hours, MP4 edit lists
+/// slightly off 0, streams cut without re-encoding anywhere).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timeline {
+    tick: f64,
+    start: i64,
+}
+
+impl Timeline {
+    /// The stream's `start_time`, else the container's, else 0
+    pub(crate) fn of(ictx: &ffmpeg::format::context::Input, vs: &ffmpeg::format::stream::Stream) -> Timeline {
+        let tb = vs.time_base();
+        let tick = tb.0 as f64 / tb.1 as f64;
+        let start = if vs.start_time() != ffi::AV_NOPTS_VALUE {
+            vs.start_time()
         } else {
-            anyhow::bail!("could not determine duration");
-        }
+            let f = unsafe { (*ictx.as_ptr()).start_time };
+            if f != ffi::AV_NOPTS_VALUE { (f as f64 / ffi::AV_TIME_BASE as f64 / tick).round() as i64 } else { 0 }
+        };
+        Timeline { tick, start }
+    }
+
+    /// Seconds from the start for a timestamp in stream ticks
+    pub(crate) fn secs(&self, ts: i64) -> f64 {
+        (ts - self.start) as f64 * self.tick
+    }
+
+    /// Stream ticks for seconds from the start
+    pub(crate) fn ticks(&self, secs: f64) -> i64 {
+        (secs / self.tick) as i64 + self.start
+    }
+
+    /// Seconds for a length in ticks (no start offset)
+    pub(crate) fn len(&self, ticks: i64) -> f64 {
+        ticks as f64 * self.tick
     }
 }
 
@@ -1168,8 +1209,7 @@ fn extract_frames_seek_each(
         .best(ffmpeg::media::Type::Video)
         .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let stream_index = vs.index();
-    let tb = vs.time_base();
-    let seconds_per_tick = tb.0 as f64 / tb.1 as f64;
+    let tl = Timeline::of(&ictx, &vs);
     let codec_params = vs.parameters();
 
     // Create decoder ONCE
@@ -1201,7 +1241,7 @@ fn extract_frames_seek_each(
 
         loop {
             // Seek to timestamp using low-level API
-            let target_pts = (current_ts / seconds_per_tick) as i64;
+            let target_pts = tl.ticks(current_ts);
 
             // Use unsafe FFmpeg API directly since the safe wrapper doesn't seem to work
             unsafe {
@@ -1217,7 +1257,7 @@ fn extract_frames_seek_each(
             decoder.flush();
 
             // Extract frame at this position
-            frame_result = extract_frame_after_seek(&mut ictx, &mut decoder, stream_index, seconds_per_tick, current_ts, target, video_aspect, require_keyframe, duration);
+            frame_result = extract_frame_after_seek(&mut ictx, &mut decoder, stream_index, tl, current_ts, target, video_aspect, require_keyframe, duration);
 
             // No keyframe packet near the target: the stream doesn't flag keyframes (e.g.
             // intra-refresh H.264). Retry this position without the keyframe requirement.
@@ -1345,8 +1385,7 @@ fn extract_frames_sequential(
         .best(ffmpeg::media::Type::Video)
         .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let stream_index = vs.index();
-    let tb = vs.time_base();
-    let seconds_per_tick = tb.0 as f64 / tb.1 as f64;
+    let tl = Timeline::of(&ictx, &vs);
     let codec_params = vs.parameters();
 
     let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)?
@@ -1388,8 +1427,7 @@ fn extract_frames_sequential(
 
         while decoder.receive_frame(&mut decoded).is_ok() {
             frames_decoded += 1;
-            let frame_pts = decoded.timestamp().or(packet.dts()).unwrap_or(0);
-            let frame_seconds = frame_pts as f64 * seconds_per_tick;
+            let frame_seconds = decoded.timestamp().or(packet.dts()).map_or(0.0, |ts| tl.secs(ts));
 
             // Update progress based on video position
             let progress = (frame_seconds / duration).min(1.0);
@@ -1638,7 +1676,7 @@ fn extract_frame_after_seek(
     ictx: &mut ffmpeg::format::context::Input,
     decoder: &mut ffmpeg::decoder::Video,
     stream_index: usize,
-    seconds_per_tick: f64,
+    tl: Timeline,
     timestamp: f64,
     target: FrameTarget,
     video_aspect: f64,
@@ -1666,7 +1704,7 @@ fn extract_frame_after_seek(
             } else {
                 skipped_packets += 1;
                 let past_window = packet.dts()
-                    .map(|dts| dts as f64 * seconds_per_tick > timestamp + KEYFRAME_SEARCH_WINDOW_SECS)
+                    .map(|dts| tl.secs(dts) > timestamp + KEYFRAME_SEARCH_WINDOW_SECS)
                     .unwrap_or(false);
                 if past_window || skipped_packets >= KEYFRAME_SEARCH_MAX_PACKETS {
                     return Err(NoKeyframeFound.into());
@@ -1682,8 +1720,7 @@ fn extract_frame_after_seek(
             frames_decoded += 1;
 
             // Get frame timestamp (best effort: falls back to DTS for containers without PTS, e.g. AVI)
-            let frame_pts = decoded.timestamp().or(packet.dts()).unwrap_or(0);
-            let frame_seconds = frame_pts as f64 * seconds_per_tick;
+            let frame_seconds = decoded.timestamp().or(packet.dts()).map_or(0.0, |ts| tl.secs(ts));
 
             // Calculate distance from target
             let distance = (frame_seconds - timestamp).abs();

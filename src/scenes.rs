@@ -16,7 +16,7 @@ use ffmpeg_next::util::frame::video::Video as FfmpegFrame;
 
 use crate::scene_frames::{self, Collector, Pick};
 use crate::{bad_request, deliver_frames, encode_frame, extract, finish_frame, frames_target, probe_dimensions,
-    probe_duration, resolve_paths, AppState, EncodedFrame, ImageFormat, Prepared, ProgressTracker, Unprocessable};
+    probe_duration_opt, resolve_paths, AppState, Timeline, EncodedFrame, ImageFormat, Prepared, ProgressTracker, Unprocessable};
 
 // ---------------------------------------------------------------------------------------------
 // Request
@@ -527,29 +527,79 @@ pub(crate) struct Detection {
     pub cuts: Vec<f64>,
     pub scores: Option<ScoreLog>,
     pub stats: Stats,
+    /// Where the pass saw the video end: the last frame's (or packet's) time plus its duration
+    pub end: f64,
+}
+
+/// The duration to report: the probed one, else where the pass saw the video end (streams
+/// written to a pipe, raw streams, truncated files). The pass end doesn't override a probed
+/// duration: a timestamp jump (DVD cells, spliced TS) can put it hours past the real end.
+pub(crate) fn resolve_duration(probed: Option<f64>, end: f64) -> Result<f64> {
+    let d = probed.unwrap_or(end);
+    if d > 0.0 { Ok(d) } else { anyhow::bail!("could not determine duration: no timestamps in the video") }
+}
+
+/// A pass's progress: time over the probed duration, else bytes read over the file size
+struct PassProgress {
+    duration: Option<f64>,
+    size: Option<f64>,
+}
+
+impl PassProgress {
+    fn new(path: &str, duration: Option<f64>) -> Self {
+        let size = std::fs::metadata(path).ok().map(|m| m.len() as f64).filter(|s| *s > 0.0);
+        PassProgress { duration: duration.filter(|d| *d > 0.0), size }
+    }
+
+    fn fraction(&self, t: f64, pos: isize) -> f64 {
+        match (self.duration, self.size) {
+            (Some(d), _) => t / d,
+            (None, Some(s)) if pos >= 0 => pos as f64 / s,
+            _ => 0.0,
+        }
+        .clamp(0.0, 1.0)
+    }
+}
+
+/// Seconds per frame from the stream's frame rate (average, else real base), else 25 fps
+fn frame_interval(vs: &ffmpeg::format::stream::Stream) -> f64 {
+    for r in [vs.avg_frame_rate(), vs.rate()] {
+        if r.0 > 0 && r.1 > 0 {
+            return r.1 as f64 / r.0 as f64;
+        }
+    }
+    1.0 / 25.0
 }
 
 /// `keyframes`: a cut at every keyframe packet, from packet flags, without decoding.
 /// `min_scene_len` applies as in suppress mode.
-pub(crate) fn detect_keyframes(video_path: &str, cfg: &Resolved, duration: f64, tracker: &mut ProgressTracker) -> Result<Detection> {
+pub(crate) fn detect_keyframes(video_path: &str, cfg: &Resolved, duration: Option<f64>, tracker: &mut ProgressTracker) -> Result<Detection> {
     let started = Instant::now();
     let mut ictx = ffmpeg::format::input(&video_path)?;
     let vs = ictx.streams().best(ffmpeg::media::Type::Video).ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let stream_index = vs.index();
-    let tb = vs.time_base();
-    let seconds_per_tick = tb.0 as f64 / tb.1 as f64;
+    let tl = Timeline::of(&ictx, &vs);
+    let interval = frame_interval(&vs);
+    let progress = PassProgress::new(video_path, duration);
 
     let mut packets = 0usize;
     let mut keys: Vec<f64> = Vec::new();
+    let mut end = 0.0f64;
+    let mut last_t: Option<f64> = None;
     for (s, packet) in ictx.packets() {
         if s.index() != stream_index { continue; }
         packets += 1;
+        // No timestamp (raw elementary streams): one frame after the previous packet
+        let t = match packet.pts().or(packet.dts()) {
+            Some(ts) => tl.secs(ts),
+            None => last_t.map_or(0.0, |l| l + interval),
+        };
+        last_t = Some(t);
+        let len = if packet.duration() > 0 { tl.len(packet.duration()) } else { interval };
+        end = end.max(t + len);
         if packet.is_key() {
-            if let Some(ts) = packet.pts().or(packet.dts()) {
-                let t = ts as f64 * seconds_per_tick;
-                keys.push(t);
-                tracker.update((t / duration).min(1.0), "Detecting scenes".to_string());
-            }
+            keys.push(t);
+            tracker.update(progress.fraction(t, packet.position()), "Detecting scenes".to_string());
         }
     }
     if packets > 0 && keys.len() as f64 / packets as f64 > MAX_KEYFRAME_SHARE {
@@ -565,6 +615,7 @@ pub(crate) fn detect_keyframes(video_path: &str, cfg: &Resolved, duration: f64, 
         cuts,
         scores: None,
         stats: Stats { keyframes: Some(keys.len()), elapsed_s: started.elapsed().as_secs_f64(), ..Default::default() },
+        end,
     })
 }
 
@@ -581,7 +632,7 @@ pub(crate) struct PassFrame<'a> {
 pub(crate) fn detect_decoded(
     video_path: &str,
     cfg: &Resolved,
-    duration: f64,
+    duration: Option<f64>,
     keep_scores: bool,
     tracker: &mut ProgressTracker,
     mut sink: impl FnMut(PassFrame, &CutPipeline) -> Result<()>,
@@ -593,8 +644,12 @@ pub(crate) fn detect_decoded(
     }
     let vs = ictx.streams().best(ffmpeg::media::Type::Video).ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let stream_index = vs.index();
-    let tb = vs.time_base();
-    let seconds_per_tick = tb.0 as f64 / tb.1 as f64;
+    let tl = Timeline::of(&ictx, &vs);
+    let interval = frame_interval(&vs);
+    let progress = PassProgress::new(video_path, duration);
+    // The previous frame's time, for frames without any timestamp, and the latest end seen
+    let mut last_t: Option<f64> = None;
+    let mut end = 0.0f64;
 
     let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(vs.parameters())?;
     codec_ctx.set_threading(ffmpeg::codec::threading::Config { kind: ffmpeg::codec::threading::Type::Frame, count: 0, ..Default::default() });
@@ -621,15 +676,21 @@ pub(crate) fn detect_decoded(
     let mut small = FfmpegFrame::empty();
     let mut stats = Stats::default();
 
-    let mut handle = |decoded: &FfmpegFrame, packet_dts: Option<i64>, stats: &mut Stats, pipeline: &mut CutPipeline,
+    let mut handle = |decoded: &FfmpegFrame, packet_dts: Option<i64>, pos: isize, stats: &mut Stats, pipeline: &mut CutPipeline,
                       scaler: &mut Option<(Scaler, (ffmpeg::format::Pixel, u32, u32))>| -> Result<()> {
         stats.decoded_frames += 1;
+        // No timestamp at all (GENPTS couldn't make one): one frame after the previous
+        let t = match decoded.timestamp().or(packet_dts) {
+            Some(ts) => tl.secs(ts),
+            None => last_t.map_or(0.0, |l| l + interval),
+        };
+        last_t = Some(t);
+        end = end.max(t + interval);
         let has_errors = unsafe { (*decoded.as_ptr()).decode_error_flags != 0 };
         if has_errors {
             stats.errored_frames += 1;
             return Ok(());
         }
-        let t = decoded.timestamp().or(packet_dts).unwrap_or(0) as f64 * seconds_per_tick;
         let key = (decoded.format(), decoded.width(), decoded.height());
         if scaler.as_ref().map(|(_, k)| *k != key).unwrap_or(true) {
             let (w, h) = analysis_size(decoded.width(), decoded.height());
@@ -648,25 +709,27 @@ pub(crate) fn detect_decoded(
             }
         };
         pipeline.push(t, score);
-        tracker.update((t / duration).clamp(0.0, 1.0), "Detecting scenes".to_string());
+        tracker.update(progress.fraction(t, pos), "Detecting scenes".to_string());
         sink(PassFrame { frame: decoded, t }, pipeline)
     };
 
     let mut decoded = FfmpegFrame::empty();
     let mut packets = 0usize;
+    let mut pos = -1isize;
     for (s, packet) in ictx.packets() {
         if s.index() != stream_index { continue; }
         packets += 1;
+        pos = pos.max(packet.position());
         // A packet the decoder refuses (corrupt data) is skipped, as the extractors do
         if decoder.send_packet(&packet).is_err() { continue; }
         while decoder.receive_frame(&mut decoded).is_ok() {
-            handle(&decoded, packet.dts(), &mut stats, &mut pipeline, &mut scaler)?;
+            handle(&decoded, packet.dts(), pos, &mut stats, &mut pipeline, &mut scaler)?;
         }
     }
     // Drain the frames still buffered in the (threaded) decoder
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        handle(&decoded, None, &mut stats, &mut pipeline, &mut scaler)?;
+        handle(&decoded, None, pos, &mut stats, &mut pipeline, &mut scaler)?;
     }
     pipeline.finish();
 
@@ -681,7 +744,7 @@ pub(crate) fn detect_decoded(
     }
     stats.elapsed_s = started.elapsed().as_secs_f64();
     let CutPipeline { cuts, scores, .. } = pipeline;
-    Ok(Detection { cuts, scores, stats })
+    Ok(Detection { cuts, scores, stats, end })
 }
 
 /// The analysis copy's size: 256 px wide (or the source width if smaller), height from the
@@ -721,10 +784,8 @@ pub(crate) fn validate_request(req: &ScenesRequest) -> Result<()> {
 pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: String) -> Result<serde_json::Value> {
     let cfg = resolve(req)?;
     let (video_path, meta_path) = resolve_paths(&req.path, state)?;
-    let duration = probe_duration(&video_path)?;
-    if duration <= 1.0 {
-        anyhow::bail!("duration is too short");
-    }
+    // Not required: the passes read the whole file and see where it ends
+    let probed = probe_duration_opt(&video_path)?;
     let mut tracker = ProgressTracker::new(job_id, req.path.clone(), state.progress_tx.clone(), state.progress_interval_ms, 0);
     tracker.force_update(0.0, "Detecting scenes".to_string());
 
@@ -747,9 +808,11 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
     // Picks per scene, after trimming
     let mut picks: Vec<Pick> = Vec::new();
     let scenes;
+    let duration;
     match cfg.detector {
         Detector::Keyframes => {
-            let det = detect_keyframes(&video_path, &cfg, duration, &mut tracker)?;
+            let det = detect_keyframes(&video_path, &cfg, probed, &mut tracker)?;
+            duration = resolve_duration(probed, det.end)?;
             scenes = scenes_from_cuts(&det.cuts, duration);
             if let (Some(spec), Some(target), Some((w, h))) = (spec, target, source) {
                 // Scenes are known before any decoding: place, trim, then extract by seeking
@@ -790,12 +853,13 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
                     Some(Collector::new(spec, target, w as f64 / h as f64, quality, req.skip_blank_frames)),
                 _ => None,
             };
-            let det = detect_decoded(&video_path, &cfg, duration, req.return_scores, &mut tracker, |f, pipeline| {
+            let det = detect_decoded(&video_path, &cfg, probed, req.return_scores, &mut tracker, |f, pipeline| {
                 match &mut collector {
                     Some(c) => c.on_frame(f, pipeline),
                     None => Ok(()),
                 }
             })?;
+            duration = resolve_duration(probed, det.end)?;
             scenes = scenes_from_cuts(&det.cuts, duration);
             stats = det.stats;
             if let (Some(mut c), Some(spec)) = (collector, spec) {
@@ -973,7 +1037,7 @@ mod tests {
     /// A 6 s, 25 fps clip with hard cuts at 2 s and 4 s (testsrc → smptebars → mandelbrot),
     /// keyframes only at the cuts, plus a copy where every frame is held for 3 frames
     /// `None` only when there is no FFmpeg CLI; a failed generation panics.
-    fn synthetic_clip(dir: &std::path::Path) -> Option<(String, String)> {
+    fn synthetic_clip(dir: &std::path::Path) -> Option<(String, String, String)> {
         let ff = ffmpeg_cli()?;
         let cuts = dir.join("cuts.mkv");
         let held = dir.join("held.mkv");
@@ -990,7 +1054,15 @@ mod tests {
         run(std::process::Command::new(&ff)
             .args(["-v", "error", "-y", "-filter_complex", held_src, "-c:v", "mpeg4", "-q:v", "3"])
             .arg(&held));
-        Some((cuts.to_string_lossy().into_owned(), held.to_string_lossy().into_owned()))
+        // The cuts clip as MPEG-TS with timestamps starting at 10 s (as broadcast recordings do)
+        let offset = dir.join("cuts.ts");
+        run(std::process::Command::new(&ff)
+            .args(["-v", "error", "-y", "-i"]).arg(&cuts)
+            .args(["-c:v", "mpeg2video", "-q:v", "3", "-g", "1000", "-force_key_frames", "0,2,4", "-sc_threshold", "1000000000",
+                   "-f", "mpegts", "-output_ts_offset", "10"])
+            .arg(&offset));
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        Some((s(cuts), s(held), s(offset)))
     }
 
     fn detect(path: &str, req: serde_json::Value) -> Vec<f64> {
@@ -999,11 +1071,14 @@ mod tests {
         let req: ScenesRequest = serde_json::from_value(body).unwrap();
         let cfg = resolve(&req).unwrap();
         let mut tracker = ProgressTracker::new("t".into(), path.into(), None, 1000, 0);
-        let duration = probe_duration(path).unwrap();
+        // No duration given: the pass's own end has to match the headers'
         let det = match cfg.detector {
-            Detector::Keyframes => detect_keyframes(path, &cfg, duration, &mut tracker).unwrap(),
-            _ => detect_decoded(path, &cfg, duration, false, &mut tracker, |_, _| Ok(())).unwrap(),
+            Detector::Keyframes => detect_keyframes(path, &cfg, None, &mut tracker).unwrap(),
+            _ => detect_decoded(path, &cfg, None, false, &mut tracker, |_, _| Ok(())).unwrap(),
         };
+        let probed = probe_duration_opt(path).unwrap().unwrap();
+        assert!((det.end - probed).abs() <= 1.0 / 25.0 + 1e-6, "end {} vs probed {probed}", det.end);
+        let duration = resolve_duration(None, det.end).unwrap();
         scenes_from_cuts(&det.cuts, duration).iter().skip(1).map(|(s, _)| *s).collect()
     }
 
@@ -1016,7 +1091,7 @@ mod tests {
         ffmpeg::init().unwrap();
         let dir = std::env::temp_dir().join(format!("thumbs-collage-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let Some((cuts, held)) = synthetic_clip(&dir) else {
+        let Some((cuts, held, offset)) = synthetic_clip(&dir) else {
             eprintln!("skipping: no ffmpeg CLI found (set FFMPEG_DIR or put ffmpeg on PATH)");
             return;
         };
@@ -1032,6 +1107,9 @@ mod tests {
         ] {
             let got = detect(&cuts, req.clone());
             assert!(near(&got, &want), "{req}: got {got:?}, want {want:?}");
+            // Times are from the stream's start, not its first timestamp
+            let got = detect(&offset, req.clone());
+            assert!(near(&got, &want), "{req} on a stream starting at 10 s: got {got:?}, want {want:?}");
         }
         // Held frames: plain content finds the one cut, not the pan's picture changes
         let got = detect(&held, serde_json::json!({ "hint": "anime" }));
@@ -1046,9 +1124,9 @@ mod tests {
         let req: ScenesRequest = serde_json::from_value(body).unwrap();
         let cfg = resolve(&req).unwrap();
         let mut tracker = ProgressTracker::new("t".into(), path.into(), None, 1000, 0);
-        let duration = probe_duration(path).unwrap();
+        let duration = probe_duration_opt(path).unwrap();
         let det = detect_decoded(path, &cfg, duration, true, &mut tracker, |_, _| Ok(())).unwrap();
-        let cuts = scenes_from_cuts(&det.cuts, duration).iter().skip(1).map(|(s, _)| (s * fps).round() as i64).collect();
+        let cuts = scenes_from_cuts(&det.cuts, resolve_duration(duration, det.end).unwrap()).iter().skip(1).map(|(s, _)| (s * fps).round() as i64).collect();
         (cuts, det.scores.unwrap())
     }
 

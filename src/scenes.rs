@@ -894,7 +894,7 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
                 _ => None,
             };
             let mut collector = new_collector();
-            let mut pass = |skip: bool, collector: &mut Option<Collector>, tracker: &mut ProgressTracker| {
+            let pass = |skip: bool, collector: &mut Option<Collector>, tracker: &mut ProgressTracker| {
                 detect_decoded(&video_path, &cfg, probed, req.return_scores, skip, tracker, |f, pipeline| {
                     match collector {
                         Some(c) => c.on_frame(f, pipeline),
@@ -920,11 +920,7 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
                 c.finish(&det.cuts, duration)?;
                 stats.candidates = Some(c.candidates_kept);
                 // Group the picks by scene, then trim
-                let mut per_scene: Vec<Vec<Pick>> = (0..scenes.len()).map(|_| Vec::new()).collect();
-                for p in c.picks {
-                    let i = scene_index(&scenes, p.scene_start);
-                    per_scene[i].push(p);
-                }
+                let per_scene = group_picks(&scenes, c.picks);
                 let mut counts: Vec<usize> = per_scene.iter().map(Vec::len).collect();
                 let before: usize = counts.iter().sum();
                 if let Some(max) = spec.max_frames {
@@ -1006,6 +1002,21 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
 /// The scene a pick belongs to: the last scene starting at or before the pick's scene start
 fn scene_index(scenes: &[(f64, f64)], scene_start: f64) -> usize {
     scenes.iter().rposition(|(s, _)| *s <= scene_start + 1e-9).unwrap_or(0)
+}
+
+/// Picks per reported scene. The collector closed a scene at every cut, but `scenes_from_cuts`
+/// drops cuts at or past `duration` (a header duration shorter than the content): picks from
+/// such scenes, or past their scene's end, are dropped instead of piling into the last scene.
+fn group_picks(scenes: &[(f64, f64)], picks: Vec<Pick>) -> Vec<Vec<Pick>> {
+    let mut per_scene: Vec<Vec<Pick>> = (0..scenes.len()).map(|_| Vec::new()).collect();
+    for p in picks {
+        let i = scene_index(scenes, p.scene_start);
+        let (s, e) = scenes[i];
+        if (p.scene_start - s).abs() <= 1e-9 && p.timestamp < e {
+            per_scene[i].push(p);
+        }
+    }
+    per_scene
 }
 
 #[cfg(test)]
@@ -1217,6 +1228,45 @@ mod tests {
     /// A short scene right after a long one gets its frames: the long scene's candidates are
     /// thinned, but sampling of the next scene must not be (it was: the doubled step carried
     /// over, and the 1.6 s scene after a 57 s one got none)
+    /// Timestamps that keep going backward (broken pts): every frame is sampled, and thinning
+    /// by spacing can't reduce them; it must still finish and bound the candidates
+    #[test]
+    fn backward_timestamps_terminate() {
+        ffmpeg::init().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let req: ScenesRequest = serde_json::from_value(serde_json::json!({ "path": "x" })).unwrap();
+            let cfg = resolve(&req).unwrap();
+            let spec: scene_frames::SceneFramesSpec = serde_json::from_value(serde_json::json!({ "max_per_scene": 1 })).unwrap();
+            let target = crate::FrameTarget { w: 32, h: 18, fit: crate::FitMode::Cover };
+            let mut p = CutPipeline::new(&cfg, false);
+            let mut c = Collector::new(&spec, target, 16.0 / 9.0, Some(80), false);
+            let frame = FfmpegFrame::new(ffmpeg::format::Pixel::YUV420P, 32, 18);
+            for i in 0..200 {
+                let t = 1000.0 - i as f64 * 0.5;
+                p.push(t, 0.0);
+                c.on_frame(PassFrame { frame: &frame, t }, &p).unwrap();
+            }
+            p.finish();
+            c.finish(&p.cuts, 1000.5).unwrap();
+            tx.send(c.picks.len()).unwrap();
+        });
+        let picks = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("collector did not finish");
+        assert!(picks <= 1, "{picks} picks");
+    }
+
+    /// Picks from scenes past the reported duration (cuts `scenes_from_cuts` dropped) or past
+    /// their scene's end are dropped, not filed under the last scene
+    #[test]
+    fn picks_past_duration_are_dropped() {
+        let pick = |scene_start: f64, timestamp: f64| Pick { scene_start, target: timestamp, timestamp, bytes: Vec::new() };
+        let scenes = scenes_from_cuts(&[10.0, 25.0, 30.0], 20.0);
+        assert_eq!(scenes, vec![(0.0, 10.0), (10.0, 20.0)]);
+        let per = group_picks(&scenes, vec![pick(0.0, 5.0), pick(10.0, 15.0), pick(10.0, 22.0), pick(25.0, 27.0), pick(30.0, 31.0)]);
+        let ts: Vec<Vec<f64>> = per.iter().map(|v| v.iter().map(|p| p.timestamp).collect()).collect();
+        assert_eq!(ts, vec![vec![5.0], vec![15.0]]);
+    }
+
     #[test]
     fn short_scene_after_long_scene_gets_frames() {
         ffmpeg::init().unwrap();

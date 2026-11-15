@@ -574,9 +574,6 @@ fn resolve_paths(req_path: &str, state: &AppState) -> Result<(String, Option<Str
     Ok((absolute_path, meta_path))
 }
 
-/// Blocking processing function (runs inside spawn_blocking)
-///
-/// Returns: Assembled collage JPEG bytes, plus overall metadata JSON.
 /// What the probe step found out about a video, plus the timestamps the selection resolves to
 struct Prepared {
     video_path: String,
@@ -708,6 +705,9 @@ fn extract(
     Ok(Extracted { frames: imgs, fallback_level })
 }
 
+/// Blocking processing function (runs inside spawn_blocking)
+///
+/// Returns: Assembled collage JPEG bytes, plus overall metadata JSON.
 fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(Vec<u8>, serde_json::Value)> {
     // 1-2) probe and compute timestamps
     let prep = prepare(&req.path, &req.selection, state)?;

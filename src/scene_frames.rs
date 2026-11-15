@@ -225,6 +225,14 @@ impl<'a> Collector<'a> {
                 });
                 self.last_kept = last;
                 if self.candidates.len() <= cap { break; }
+                // Spacing can't thin what it can't measure: once it exceeds the candidates'
+                // span (timestamps running backward keep every frame), thin by count
+                let (lo, hi) = self.candidates.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (t, _)| (lo.min(*t), hi.max(*t)));
+                if spacing > hi - lo {
+                    self.candidates = thin(std::mem::take(&mut self.candidates), cap);
+                    self.last_kept = self.candidates.last().map_or(f64::NEG_INFINITY, |c| c.0);
+                    break;
+                }
                 self.settled_step *= 2.0;
             }
             // From now on a frame is scaled only if it fits the spacing

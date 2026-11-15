@@ -2,6 +2,8 @@
 //! single decode pass, and `max_frames` trimming.
 
 use anyhow::Result;
+use ffmpeg_next::ffi;
+use ffmpeg_next::util::frame::video::Video as FfmpegFrame;
 use image::DynamicImage;
 
 use crate::scenes::{CutPipeline, PassFrame};
@@ -108,25 +110,37 @@ pub(crate) struct Pick {
     pub bytes: Vec<u8>,
 }
 
-/// Keeps candidate frames every `every/4` while scenes are open, and picks from them when a
+/// Unsettled sampled frames held unscaled at most; past this the oldest is resolved anyway
+/// (a long `min_scene_len` or a timestamp jump backward), as if it were settled
+const MAX_HELD: usize = 16;
+
+/// Samples a frame every `every/4` while scenes are open, and picks from the candidates when a
 /// scene's end cut becomes final.
 ///
 /// Sampling never slows down: a cut can become final well after its frame (the adaptive window,
 /// a pending merge), and the scene after it needs its candidates from its first frame on.
-/// Memory is bounded by thinning only settled candidates (before `settled_before`, so certainly
-/// in the open scene) to a spacing that doubles as the scene grows: a long scene keeps fewer,
-/// evenly spaced ones.
+/// A sampled frame a later cut could still separate from the open scene (at or after
+/// `settled_before`) is held as an unscaled reference to the decoder's frame. Once settled it is
+/// scaled and kept only if it fits the open scene's spacing, which doubles while more than
+/// 8 x `max_per_scene` candidates remain: a long scene keeps fewer, evenly spaced ones, and
+/// most of its frames are never scaled. Held frames before a cut go to the scene it closes.
 pub(crate) struct Collector<'a> {
     spec: &'a SceneFramesSpec,
     target: FrameTarget,
     video_aspect: f64,
     quality: Option<u8>,
     skip_blank: bool,
+    /// Settled candidates of the open scene, scaled
     candidates: Vec<(f64, DynamicImage)>,
+    /// Sampled frames not settled yet, unscaled, in arrival order
+    held: std::collections::VecDeque<(f64, FfmpegFrame)>,
     step: f64,
     next_t: f64,
-    /// Spacing of the open scene's thinned candidates (`step` until the first thinning)
+    last_t: f64,
+    /// Spacing of the open scene's candidates (`step` until the first thinning)
     settled_step: f64,
+    /// Time of the newest candidate kept in the open scene
+    last_kept: f64,
     cuts_seen: usize,
     scene_start: f64,
     pub picks: Vec<Pick>,
@@ -138,9 +152,12 @@ impl<'a> Collector<'a> {
         Collector {
             spec, target, video_aspect, quality, skip_blank,
             candidates: Vec::new(),
+            held: std::collections::VecDeque::new(),
             step: spec.every / 4.0,
             next_t: f64::NEG_INFINITY,
+            last_t: f64::NEG_INFINITY,
             settled_step: spec.every / 4.0,
+            last_kept: f64::NEG_INFINITY,
             cuts_seen: 0,
             scene_start: 0.0,
             picks: Vec::new(),
@@ -157,30 +174,61 @@ impl<'a> Collector<'a> {
                 self.close(cut)?;
             }
         }
+        // A timestamp jump backward restarts the sampling (it would wait for the old time)
+        if f.t < self.last_t {
+            self.next_t = f.t;
+        }
+        self.last_t = f.t;
+        let settled_before = pipeline.settled_before();
+        while let Some((t, _)) = self.held.front() {
+            if *t >= settled_before && self.held.len() <= MAX_HELD { break; }
+            let (t, frame) = self.held.pop_front().unwrap();
+            self.settle(t, &frame)?;
+        }
         if f.t >= self.next_t {
-            let img = decode_and_scale_frame(f.frame, self.target, self.video_aspect)?;
-            self.candidates.push((f.t, finish_frame(&img, self.target)));
-            self.candidates_kept += 1;
             self.next_t = f.t + self.step;
-            let settled_before = pipeline.settled_before();
-            let cap = CANDIDATES_PER_PICK * self.spec.max_per_scene;
-            let settled = |c: &[(f64, DynamicImage)]| c.iter().take_while(|(t, _)| *t < settled_before).count();
-            if settled(&self.candidates) > cap {
-                // Bound memory per scene: thin the settled candidates to the current spacing
-                // (the newest came in at `step`), doubling it only while that isn't enough
-                loop {
-                    let spacing = self.settled_step - self.step / 2.0;
-                    let mut last_kept = f64::NEG_INFINITY;
-                    self.candidates.retain(|(t, _)| {
-                        if *t >= settled_before { return true; }
-                        let keep = *t - last_kept >= spacing;
-                        if keep { last_kept = *t; }
-                        keep
-                    });
-                    if settled(&self.candidates) <= cap { break; }
-                    self.settled_step *= 2.0;
+            if f.t < settled_before && self.held.is_empty() {
+                self.settle(f.t, f.frame)?;
+            } else {
+                // A new reference to the decoder's buffers, not a copy
+                let mut r = FfmpegFrame::empty();
+                if unsafe { ffi::av_frame_ref(r.as_mut_ptr(), f.frame.as_ptr()) } < 0 {
+                    anyhow::bail!("av_frame_ref failed");
                 }
+                self.held.push_back((f.t, r));
             }
+        }
+        Ok(())
+    }
+
+    /// A sampled frame known to be in the open scene: keep it if it fits the scene's spacing,
+    /// and thin the scene's candidates (doubling the spacing) while there are too many
+    fn settle(&mut self, t: f64, frame: &FfmpegFrame) -> Result<()> {
+        // Every sampled frame until the scene's first thinning (a restart at a cut can sample
+        // closer than `step`); after a jump backward too, which the spacing can't measure
+        let spacing = self.settled_step - self.step / 2.0;
+        if self.settled_step > self.step && t - self.last_kept < spacing && t >= self.last_kept { return Ok(()); }
+        let img = decode_and_scale_frame(frame, self.target, self.video_aspect)?;
+        self.candidates.push((t, finish_frame(&img, self.target)));
+        self.candidates_kept += 1;
+        self.last_kept = t;
+        let cap = CANDIDATES_PER_PICK * self.spec.max_per_scene;
+        if self.candidates.len() > cap {
+            // Thin to the current spacing, doubling it only while that isn't enough
+            loop {
+                let spacing = self.settled_step - self.step / 2.0;
+                let mut last = f64::NEG_INFINITY;
+                self.candidates.retain(|(t, _)| {
+                    let keep = *t - last >= spacing || *t < last;
+                    if keep { last = *t; }
+                    keep
+                });
+                self.last_kept = last;
+                if self.candidates.len() <= cap { break; }
+                self.settled_step *= 2.0;
+            }
+            // From now on a frame is scaled only if it fits the spacing
+            self.settled_step = self.settled_step.max(2.0 * self.step);
         }
         Ok(())
     }
@@ -200,8 +248,16 @@ impl<'a> Collector<'a> {
 
     fn close(&mut self, end: f64) -> Result<()> {
         let start = self.scene_start;
-        let split = self.candidates.iter().position(|(t, _)| *t >= end).unwrap_or(self.candidates.len());
-        let mut cands: Vec<(f64, DynamicImage)> = self.candidates.drain(..split).collect();
+        // Held frames before the cut belong to this scene (later cuts come after it)
+        while let Some((t, _)) = self.held.front() {
+            if *t >= end { break; }
+            let (t, frame) = self.held.pop_front().unwrap();
+            self.settle(t, &frame)?;
+        }
+        // (a frame past the cut is a candidate only if it was resolved early: `MAX_HELD`)
+        let (mut cands, rest): (Vec<(f64, DynamicImage)>, Vec<_>) =
+            std::mem::take(&mut self.candidates).into_iter().partition(|(t, _)| *t < end);
+        self.candidates = rest;
         let k = wanted(self.spec, start, end);
         let mut used = vec![false; cands.len()];
         let mut chosen = Vec::new();
@@ -231,6 +287,7 @@ impl<'a> Collector<'a> {
         self.scene_start = end;
         self.next_t = self.next_t.min(end);
         self.settled_step = self.step;
+        self.last_kept = self.candidates.last().map_or(f64::NEG_INFINITY, |c| c.0);
         Ok(())
     }
 }

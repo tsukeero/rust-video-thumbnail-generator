@@ -396,6 +396,8 @@ pub(crate) struct CutPipeline {
     window_buf: std::collections::VecDeque<(f64, f64)>,
     frames_seen: usize,
     flash: FlashFilter,
+    /// Time of the last frame given to the flash filter
+    last_judged: Option<f64>,
     pub cuts: Vec<f64>,
     pub scores: Option<ScoreLog>,
 }
@@ -416,12 +418,29 @@ impl CutPipeline {
             window_buf: std::collections::VecDeque::new(),
             frames_seen: 0,
             flash: FlashFilter::new(cfg.flash_filter.unwrap_or(FlashMode::Merge), cfg.min_scene_len),
+            last_judged: None,
             cuts: Vec::new(),
             scores: keep_scores.then(|| ScoreLog { ratio: cfg.adaptive.map(|_| Vec::new()), ..Default::default() }),
         }
     }
 
+    /// Every cut not emitted yet will be at or after this time: frames before it are settled
+    /// in their scene. Lags the newest frame by the adaptive window, and in merge mode by a
+    /// pending merge whose span already reached the minimum length: its cut comes out at the
+    /// last frame above the test, at most `min_scene_len` later. A merge still short of that
+    /// can only end at a later frame above the test, so it holds nothing back (otherwise a long
+    /// quiet scene after one would keep every candidate).
+    pub fn settled_before(&self) -> f64 {
+        let judged = self.last_judged.map_or(f64::NEG_INFINITY, |t| t + 1e-9);
+        let f = &self.flash;
+        match (f.merge_triggered, f.last_above) {
+            (true, Some(last_above)) if f.met(f.merge_start, last_above) => judged.min(last_above),
+            _ => judged,
+        }
+    }
+
     fn emit(&mut self, t: f64, above: bool) {
+        self.last_judged = Some(t);
         if let Some(cut) = self.flash.filter(t, above) {
             self.cuts.push(cut);
         }
@@ -1114,6 +1133,92 @@ mod tests {
         // Held frames: plain content finds the one cut, not the pan's picture changes
         let got = detect(&held, serde_json::json!({ "hint": "anime" }));
         assert!(near(&got, &[2.0]), "held frames: got {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `settled_before` is safe (no later cut comes before it) and bounded (it trails the newest
+    /// frame by at most `min_scene_len` plus the adaptive window), on score sequences with
+    /// random bursts of frames above the test, for every flash mode, with and without adaptive
+    #[test]
+    fn settled_before_is_safe_and_bounded() {
+        let fps = 25.0;
+        let mut seed = 12345u64;
+        let mut rand = move || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f64 / (1u64 << 31) as f64 };
+        for req in [
+            serde_json::json!({ "threshold": 27.0, "flash_filter": "merge" }),
+            serde_json::json!({ "threshold": 27.0, "flash_filter": "suppress" }),
+            serde_json::json!({ "threshold": 27.0, "flash_filter": "off" }),
+            serde_json::json!({ "hint": "real" }),
+            serde_json::json!({ "hint": "real", "flash_filter": "suppress" }),
+        ] {
+            let mut body = serde_json::json!({ "path": "x" });
+            body.as_object_mut().unwrap().extend(req.as_object().unwrap().clone());
+            let cfg = resolve(&serde_json::from_value(body).unwrap()).unwrap();
+            let lag_bound = cfg.min_scene_len + cfg.adaptive.map_or(0, |a| a.window + 1) as f64 / fps + 1e-6;
+            for _ in 0..50 {
+                let mut p = CutPipeline::new(&cfg, false);
+                let mut settled = Vec::new();
+                let mut burst = 0usize;
+                for i in 0..3000 {
+                    let t = i as f64 / fps;
+                    if burst == 0 && rand() < 0.02 { burst = 1 + (rand() * 30.0) as usize; }
+                    // inside a burst: frames above the test at random; outside: quiet, with rare single cuts
+                    let above = if burst > 0 { burst -= 1; rand() < 0.5 } else { rand() < 0.005 };
+                    p.push(t, if above { 80.0 } else { 2.0 + rand() });
+                    let s = p.settled_before();
+                    assert!(t - s <= lag_bound, "{req}: settled_before {s} trails frame {t} by more than {lag_bound}");
+                    settled.push((p.cuts.len(), s));
+                }
+                p.finish();
+                for (emitted, s) in settled {
+                    for &c in &p.cuts[emitted..] {
+                        assert!(c >= s, "{req}: cut {c} emitted after settled_before was {s}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A short scene right after a long one gets its frames: the long scene's candidates are
+    /// thinned, but sampling of the next scene must not be (it was: the doubled step carried
+    /// over, and the 1.6 s scene after a 57 s one got none)
+    #[test]
+    fn short_scene_after_long_scene_gets_frames() {
+        ffmpeg::init().unwrap();
+        let Some(ff) = ffmpeg_cli() else {
+            eprintln!("skipping: no ffmpeg CLI found (set FFMPEG_DIR or put ffmpeg on PATH)");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("thumbs-collage-test-ls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("long_short.mkv");
+        let src = "testsrc2=size=160x90:rate=24000/1001:duration=57[a];smptebars=size=160x90:rate=24000/1001:duration=1.6[b];\
+                   mandelbrot=size=160x90:rate=24000/1001,trim=duration=3,setpts=PTS-STARTPTS[c];[a][b][c]concat=n=3:v=1:a=0,format=yuv420p";
+        let ok = std::process::Command::new(&ff)
+            .args(["-v", "error", "-y", "-filter_complex", src, "-c:v", "mpeg4", "-q:v", "3"])
+            .arg(&clip).status().expect("run ffmpeg").success();
+        assert!(ok, "ffmpeg failed");
+        let path = clip.to_string_lossy().into_owned();
+        let spec: scene_frames::SceneFramesSpec = serde_json::from_value(serde_json::json!({ "min_per_scene": 2 })).unwrap();
+        let target = crate::FrameTarget { w: 32, h: 18, fit: crate::FitMode::Cover };
+        for req in [serde_json::json!({}), serde_json::json!({ "flash_filter": "suppress" }), serde_json::json!({ "hint": "real" })] {
+            let mut body = serde_json::json!({ "path": path });
+            body.as_object_mut().unwrap().extend(req.as_object().unwrap().clone());
+            let req_parsed: ScenesRequest = serde_json::from_value(body).unwrap();
+            let cfg = resolve(&req_parsed).unwrap();
+            let mut tracker = ProgressTracker::new("t".into(), path.clone(), None, 1000, 0);
+            let mut c = Collector::new(&spec, target, 16.0 / 9.0, Some(80), false);
+            let det = detect_decoded(&path, &cfg, None, false, &mut tracker, |f, p| c.on_frame(f, p)).unwrap();
+            let duration = resolve_duration(None, det.end).unwrap();
+            c.finish(&det.cuts, duration).unwrap();
+            let scenes = scenes_from_cuts(&det.cuts, duration);
+            assert_eq!(scenes.len(), 3, "{req}: scenes {scenes:?}");
+            for (i, (s, e)) in scenes.iter().enumerate() {
+                let picks: Vec<f64> = c.picks.iter().filter(|p| p.scene_start == *s).map(|p| p.timestamp).collect();
+                assert!(picks.len() >= 2, "{req}: scene {i} ({s:.2}-{e:.2}) got {picks:?}");
+                assert!(picks.iter().all(|t| t >= s && t < e), "{req}: scene {i} ({s:.2}-{e:.2}) got {picks:?}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -435,7 +435,7 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 
 - A scene with `k` frames gets them evenly spread between its margins.
 - `max_frames` first removes frames down to `min_per_scene`, one at a time from the scene with the most, then drops whole scenes' frames, shortest scene first.
-- With `content` and `scdet`, frames are taken from candidates kept during the detection pass, so no second decode is needed. `timestamp` is the chosen frame's time, `target` the position placement asked for.
+- With `content` and `scdet`, frames are taken from candidates kept during the detection pass, so no second decode is needed. `timestamp` is the chosen frame's time, `target` the position placement asked for. Candidates are every `every / 4` seconds from each scene's start, so `timestamp` is within about `every / 8` of `target`; in scenes longer than about `2 × every × max_per_scene` they are thinned, and the distance grows (the targets there are far apart). A scene shorter than about `every / 2` may get fewer than `min_per_scene` frames.
 - With `keyframes`, frames are extracted afterwards by seeking, as in `/frames`.
 - Each JPEG carries a COM marker with `{video, duration, index, scene, target, timestamp}`.
 

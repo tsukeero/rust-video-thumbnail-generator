@@ -36,7 +36,8 @@ fn default_min_per_scene() -> usize { 1 }
 fn default_max_per_scene() -> usize { 3 }
 fn default_margin() -> f64 { 0.25 }
 
-/// Candidates kept per open scene before they are thinned out, as a multiple of `max_per_scene`
+/// Settled candidates kept per open scene before they are thinned out, as a multiple of
+/// `max_per_scene`
 const CANDIDATES_PER_PICK: usize = 8;
 
 pub(crate) fn validate(spec: &SceneFramesSpec) -> Result<()> {
@@ -107,8 +108,14 @@ pub(crate) struct Pick {
     pub bytes: Vec<u8>,
 }
 
-/// Keeps candidate frames on a time grid while scenes are open, and picks from them when a
+/// Keeps candidate frames every `every/4` while scenes are open, and picks from them when a
 /// scene's end cut becomes final.
+///
+/// Sampling never slows down: a cut can become final well after its frame (the adaptive window,
+/// a pending merge), and the scene after it needs its candidates from its first frame on.
+/// Memory is bounded by thinning only settled candidates (before `settled_before`, so certainly
+/// in the open scene) to a spacing that doubles as the scene grows: a long scene keeps fewer,
+/// evenly spaced ones.
 pub(crate) struct Collector<'a> {
     spec: &'a SceneFramesSpec,
     target: FrameTarget,
@@ -118,6 +125,8 @@ pub(crate) struct Collector<'a> {
     candidates: Vec<(f64, DynamicImage)>,
     step: f64,
     next_t: f64,
+    /// Spacing of the open scene's thinned candidates (`step` until the first thinning)
+    settled_step: f64,
     cuts_seen: usize,
     scene_start: f64,
     pub picks: Vec<Pick>,
@@ -131,6 +140,7 @@ impl<'a> Collector<'a> {
             candidates: Vec::new(),
             step: spec.every / 4.0,
             next_t: f64::NEG_INFINITY,
+            settled_step: spec.every / 4.0,
             cuts_seen: 0,
             scene_start: 0.0,
             picks: Vec::new(),
@@ -152,11 +162,24 @@ impl<'a> Collector<'a> {
             self.candidates.push((f.t, finish_frame(&img, self.target)));
             self.candidates_kept += 1;
             self.next_t = f.t + self.step;
-            if self.candidates.len() > CANDIDATES_PER_PICK * self.spec.max_per_scene {
-                // Bound memory per scene: keep every other candidate, halve the density
-                let mut i = 0;
-                self.candidates.retain(|_| { i += 1; i % 2 == 1 });
-                self.step *= 2.0;
+            let settled_before = pipeline.settled_before();
+            let cap = CANDIDATES_PER_PICK * self.spec.max_per_scene;
+            let settled = |c: &[(f64, DynamicImage)]| c.iter().take_while(|(t, _)| *t < settled_before).count();
+            if settled(&self.candidates) > cap {
+                // Bound memory per scene: thin the settled candidates to the current spacing
+                // (the newest came in at `step`), doubling it only while that isn't enough
+                loop {
+                    let spacing = self.settled_step - self.step / 2.0;
+                    let mut last_kept = f64::NEG_INFINITY;
+                    self.candidates.retain(|(t, _)| {
+                        if *t >= settled_before { return true; }
+                        let keep = *t - last_kept >= spacing;
+                        if keep { last_kept = *t; }
+                        keep
+                    });
+                    if settled(&self.candidates) <= cap { break; }
+                    self.settled_step *= 2.0;
+                }
             }
         }
         Ok(())
@@ -204,9 +227,10 @@ impl<'a> Collector<'a> {
             let bytes = encode_frame(&img, self.spec.format, self.quality)?;
             self.picks.push(Pick { scene_start: start, target, timestamp: t, bytes });
         }
-        // Restart the grid for the next scene
+        // Restart the grid at the next scene's first frame (if not sampled past it already)
         self.scene_start = end;
-        self.step = self.spec.every / 4.0;
+        self.next_t = self.next_t.min(end);
+        self.settled_step = self.step;
         Ok(())
     }
 }

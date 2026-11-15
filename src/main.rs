@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use base64::Engine;
 use anyhow::{Result, Context};
-use axum::{routing::{post, get}, Router, Json, extract::{State, ws::{WebSocket, WebSocketUpgrade}}, http::{StatusCode, HeaderMap, HeaderValue}, response::IntoResponse};
+use axum::{routing::{post, get}, Router, Json, extract::{State, ws::{WebSocket, WebSocketUpgrade}}, http::{StatusCode, HeaderMap, HeaderValue}, response::{IntoResponse, Response}};
 use bytes::Bytes;
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
@@ -16,6 +16,9 @@ use rusttype::{Font, Scale};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::time::{Duration, Instant};
 use futures::{StreamExt, SinkExt};
+
+mod scenes;
+mod scene_frames;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -247,6 +250,98 @@ struct JobRequest {
 #[derive(Clone, Debug)]
 struct Rect { x: u32, y: u32, w: u32, h: u32 }
 
+/// Size and fit an extractor scales one frame to (one target per timestamp)
+#[derive(Clone, Copy, Debug)]
+struct FrameTarget { w: u32, h: u32, fit: FitMode }
+
+/// `POST /frames` request: like `/make_collage`, but each frame comes back as its own image
+#[derive(serde::Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct FramesRequest {
+    path: String,
+    selection: FrameSelection,
+    #[serde(default)]
+    size: SizeSpec,
+    #[serde(default)]
+    format: ImageFormat,
+    #[serde(default)]
+    quality: Option<u8>,
+    #[serde(default)]
+    output: OutputSpec,
+    #[serde(default)]
+    skip_blank_frames: bool,
+    #[serde(default)]
+    force_fallback: Option<u8>,
+    #[serde(default)]
+    job_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+struct SizeSpec {
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    fit: Option<FitMode>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ImageFormat { #[default] Jpeg, Png }
+
+impl ImageFormat {
+    fn extension(self) -> &'static str {
+        match self { ImageFormat::Jpeg => "jpg", ImageFormat::Png => "png" }
+    }
+}
+
+// `Inline {}` rather than a unit variant: serde ignores unknown fields on unit variants of
+// internally tagged enums, even with deny_unknown_fields
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum OutputSpec {
+    Inline {},
+    Files {
+        #[serde(default)]
+        dir: Option<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
+}
+
+impl Default for OutputSpec {
+    fn default() -> Self { OutputSpec::Inline {} }
+}
+
+const DEFAULT_FRAME_PREFIX: &str = "frame_";
+
+/// A request that fails validation: answered with 400 instead of 500
+#[derive(Debug)]
+struct BadRequest(String);
+
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for BadRequest {}
+
+fn bad_request<T>(msg: impl Into<String>) -> Result<T> {
+    Err(BadRequest(msg.into()).into())
+}
+
+/// A valid request the video can't serve (e.g. `keyframes` on an index that flags every
+/// packet): answered with 422
+#[derive(Debug)]
+struct Unprocessable(String);
+
+impl std::fmt::Display for Unprocessable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for Unprocessable {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -287,7 +382,9 @@ async fn main() -> Result<()> {
     };
 
     let mut app = Router::new()
-        .route("/make_collage", post(make_collage));
+        .route("/make_collage", post(make_collage))
+        .route("/frames", post(frames))
+        .route("/scenes", post(scenes_handler));
 
     // Add WebSocket endpoint if enabled
     if args.ws_progress {
@@ -354,55 +451,98 @@ async fn handle_ws_progress(socket: WebSocket, state: AppState) {
     }
 }
 
-/// HTTP handler
-async fn make_collage(State(state): State<AppState>, Json(req): Json<JobRequest>) -> impl IntoResponse {
-    // hard-cap: try to acquire without waiting
-    let permit = match state.sem.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::TOO_MANY_REQUESTS, "too many concurrent jobs").into_response(),
+fn error_response(status: StatusCode, msg: String) -> Response {
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// Map a job error to a response: validation errors are 400, everything else 500.
+/// `{:#}` prints the context chain (e.g. "cannot write X: Access is denied").
+fn job_error_response(e: anyhow::Error) -> Response {
+    let status = if e.is::<BadRequest>() {
+        StatusCode::BAD_REQUEST
+    } else if e.is::<Unprocessable>() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     };
+    error_response(status, format!("{:#}", e))
+}
 
-    // Use job_id from request or generate a unique one
-    let job_id = req.job_id.clone().unwrap_or_else(||
+/// The request's job_id, or a generated one
+fn job_id_or_new(job_id: &Option<String>) -> String {
+    job_id.clone().unwrap_or_else(||
         format!("job_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-    );
+    )
+}
 
-    // run blocking work on a thread pool
+/// Run a job on the blocking pool under a worker permit. A full semaphore answers 429 at once,
+/// without queueing.
+async fn run_job<T, F>(state: &AppState, job: F) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce(AppState) -> Result<T> + Send + 'static,
+{
+    let permit = state.sem.clone().try_acquire_owned()
+        .map_err(|_| (StatusCode::TOO_MANY_REQUESTS, "too many concurrent jobs").into_response())?;
     let state2 = state.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        let res = process_video(&req, &state2, job_id);
+        let res = job(state2);
         drop(permit); // release permit here
         res
     });
-
     match handle.await {
-        Ok(Ok((collage_jpeg, overall_meta))) => {
-            // Return the assembled collage as a JPEG image
-            let mut headers = HeaderMap::new();
-            headers.insert("content-type", HeaderValue::from_static("image/jpeg"));
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(job_error_response(e)),
+        Err(join_err) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("task join error: {}", join_err))),
+    }
+}
 
-            // Include overall metadata as JSON header (base64 encoded)
-            if let Ok(meta_bytes) = serde_json::to_vec(&overall_meta) {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&meta_bytes);
-                if let Ok(header_val) = HeaderValue::from_str(&b64) {
-                    headers.insert("x-collage-meta-b64", header_val);
-                }
-            }
+/// HTTP handler
+async fn make_collage(State(state): State<AppState>, Json(req): Json<JobRequest>) -> Response {
+    let job_id = job_id_or_new(&req.job_id);
+    let (collage_jpeg, overall_meta) = match run_job(&state, move |st| process_video(&req, &st, job_id)).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
-            (headers, Bytes::from(collage_jpeg)).into_response()
+    // Return the assembled collage as a JPEG image
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("image/jpeg"));
+
+    // Include overall metadata as JSON header (base64 encoded)
+    if let Ok(meta_bytes) = serde_json::to_vec(&overall_meta) {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&meta_bytes);
+        if let Ok(header_val) = HeaderValue::from_str(&b64) {
+            headers.insert("x-collage-meta-b64", header_val);
         }
-        Ok(Err(e)) => {
-            let error_json = serde_json::json!({
-                "error": format!("{}", e)
-            });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_json)).into_response()
-        }
-        Err(join_err) => {
-            let error_json = serde_json::json!({
-                "error": format!("task join error: {}", join_err)
-            });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_json)).into_response()
-        }
+    }
+
+    (headers, Bytes::from(collage_jpeg)).into_response()
+}
+
+/// HTTP handler for `POST /scenes`
+async fn scenes_handler(State(state): State<AppState>, Json(req): Json<scenes::ScenesRequest>) -> Response {
+    // Validate before taking a worker, so a bad request never occupies one
+    if let Err(e) = scenes::validate_request(&req) {
+        return job_error_response(e);
+    }
+    let job_id = job_id_or_new(&req.job_id);
+    match run_job(&state, move |st| scenes::process_scenes(&req, &st, job_id)).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// HTTP handler for `POST /frames`
+async fn frames(State(state): State<AppState>, Json(req): Json<FramesRequest>) -> Response {
+    // Validate before taking a worker, so a bad request never occupies one
+    if let Err(e) = validate_frames_request(&req) {
+        return job_error_response(e);
+    }
+    let job_id = job_id_or_new(&req.job_id);
+    match run_job(&state, move |st| process_frames(&req, &st, job_id)).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -434,23 +574,32 @@ fn resolve_paths(req_path: &str, state: &AppState) -> Result<(String, Option<Str
     Ok((absolute_path, meta_path))
 }
 
-/// Blocking processing function (runs inside spawn_blocking)
-///
-/// Returns: Assembled collage JPEG bytes, plus overall metadata JSON.
-fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(Vec<u8>, serde_json::Value)> {
-    // Resolve paths
-    let (video_path, meta_path) = resolve_paths(&req.path, state)?;
+/// What the probe step found out about a video, plus the timestamps the selection resolves to
+struct Prepared {
+    video_path: String,
+    meta_path: Option<String>,
+    duration: f64,
+    width: u32,
+    height: u32,
+    timestamps: Vec<f64>,
+}
 
-    // 1) probe duration and dimensions
+impl Prepared {
+    fn aspect(&self) -> f64 { self.width as f64 / self.height as f64 }
+}
+
+/// Steps 1-2, shared by all endpoints: resolve the path, probe duration and dimensions,
+/// and turn the selection into timestamps (in request order).
+fn prepare(path: &str, selection: &FrameSelection, state: &AppState) -> Result<Prepared> {
+    let (video_path, meta_path) = resolve_paths(path, state)?;
+
     let duration = probe_duration(&video_path)?;
-    if(duration <= 1.0) {
+    if duration <= 1.0 {
         anyhow::bail!("duration is too short");
     }
-    let (video_w, video_h) = probe_dimensions(&video_path)?;
-    let video_aspect = video_w as f64 / video_h as f64;
+    let (width, height) = probe_dimensions(&video_path)?;
 
-    // 2) compute timestamps
-    let timestamps = match &req.selection {
+    let timestamps = match selection {
         FrameSelection::Timestamps { timestamps } => timestamps.clone(),
         FrameSelection::Uniform { frames, start_offset, end_offset } => {
             let start = *start_offset;
@@ -464,53 +613,48 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
         }
     };
 
-    // 3) compute collage output size and rects
-    let (out_w, out_h, rects) = match &req.collage {
-        CollageSpec::Grid { rows, cols, spacing, margin, width, height, background: _ } => {
-            let (ow, oh) = derive_output_size_grid(*width, *height, video_aspect, *rows, *cols, *spacing, *margin);
-            let rects = compute_grid_layout(*rows, *cols, *spacing, *margin, ow, oh);
-            (ow, oh, rects)
-        }
-        CollageSpec::Advanced { pieces, spacing, margin, width, height, background: _ } => {
-            let (ow, oh) = derive_output_size_adv(*width, *height, video_aspect);
-            let rects = compute_advanced_layout(&pieces, *margin, *spacing, ow, oh);
-            (ow, oh, rects)
-        }
-    };
+    Ok(Prepared { video_path, meta_path, duration, width, height, timestamps })
+}
 
-    let fit_mode = req.fit.unwrap_or(FitMode::Cover);
-    let thumb_hint_w = req.thumb_w.unwrap_or(0);
-    let thumb_hint_h = req.thumb_h.unwrap_or(0);
+/// Frames from the extraction tiers, plus the tier that produced them
+/// (0 seek, 1 keyframes, 2 sequential)
+struct Extracted {
+    frames: Vec<Option<(DynamicImage, f64)>>,
+    fallback_level: u8,
+}
 
-    // Create progress tracker for fallback 0 (seek mode)
-    let mut tracker = ProgressTracker::new(
-        job_id.clone(),
-        req.path.clone(),
-        state.progress_tx.clone(),
-        state.progress_interval_ms,
-        0
-    );
+/// Steps 3-4, shared by all endpoints: run the extraction tiers for one target per timestamp,
+/// falling back as `--allow-fallback` allows, and apply the failure thresholds.
+fn extract(
+    prep: &Prepared,
+    targets: &[FrameTarget],
+    force_fallback: Option<u8>,
+    skip_blank_frames: bool,
+    state: &AppState,
+    tracker: &mut ProgressTracker,
+) -> Result<Extracted> {
+    let video_path = prep.video_path.as_str();
+    let timestamps = &prep.timestamps;
+    let duration = prep.duration;
+    let video_aspect = prep.aspect();
+    let mut fallback_level = 0;
 
-    // 4) Extract frames - check if fallback is forced
-    let mut imgs = if let Some(forced_level) = req.force_fallback {
-        if forced_level >= 1 {
-            // Force fallback mode immediately
-            eprintln!("Forcing fallback level {} as requested", forced_level);
-            tracker.fallback_level = forced_level;
-            tracker.force_update(0.0, format!("Forcing fallback level {}", forced_level));
-            extract_frames_with_genpts(&video_path, &timestamps, &rects, thumb_hint_w, thumb_hint_h,
-                fit_mode, video_aspect, forced_level, duration, req.skip_blank_frames, &mut tracker)?
-        } else {
-            // force_fallback=0 means use seek mode
-            extract_frames_seek_each(&video_path, &timestamps, &rects, thumb_hint_w, thumb_hint_h, fit_mode, video_aspect, true, &mut tracker, req.skip_blank_frames, duration)?
-        }
+    let mut imgs = if let Some(forced_level) = force_fallback.filter(|l| *l >= 1) {
+        // Force fallback mode immediately
+        eprintln!("Forcing fallback level {} as requested", forced_level);
+        tracker.fallback_level = forced_level;
+        tracker.force_update(0.0, format!("Forcing fallback level {}", forced_level));
+        let (imgs, level) = extract_frames_with_genpts(video_path, timestamps, targets,
+            video_aspect, forced_level, duration, skip_blank_frames, tracker)?;
+        fallback_level = level;
+        imgs
     } else {
-        // Normal mode: try seek first, fallback if needed
-        extract_frames_seek_each(&video_path, &timestamps, &rects, thumb_hint_w, thumb_hint_h, fit_mode, video_aspect, true, &mut tracker, req.skip_blank_frames, duration)?
+        // Seek mode: forced (force_fallback=0) or the normal first try
+        extract_frames_seek_each(video_path, timestamps, targets, video_aspect, true, tracker, skip_blank_frames, duration)?
     };
 
     // Check if we should use fallback based on failure rate and allow_fallback level (only if not forced)
-    if req.force_fallback.is_none() {
+    if force_fallback.is_none() {
         let failed_count = imgs.iter().filter(|i| i.is_none()).count();
         let failure_rate = failed_count as f64 / timestamps.len() as f64;
 
@@ -531,8 +675,10 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
             tracker.fallback_level = state.allow_fallback;
             tracker.force_update(0.0, "Starting fallback extraction".to_string());
 
-            imgs = extract_frames_with_genpts(&video_path, &timestamps, &rects, thumb_hint_w, thumb_hint_h,
-                fit_mode, video_aspect, state.allow_fallback, duration, req.skip_blank_frames, &mut tracker)?;
+            let (fallback_imgs, level) = extract_frames_with_genpts(video_path, timestamps, targets,
+                video_aspect, state.allow_fallback, duration, skip_blank_frames, tracker)?;
+            imgs = fallback_imgs;
+            fallback_level = level;
         }
     }
 
@@ -555,6 +701,57 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
             final_failed, timestamps.len(), (final_rate * 100.0) as u32
         );
     }
+
+    Ok(Extracted { frames: imgs, fallback_level })
+}
+
+/// Blocking processing function (runs inside spawn_blocking)
+///
+/// Returns: Assembled collage JPEG bytes, plus overall metadata JSON.
+fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(Vec<u8>, serde_json::Value)> {
+    // 1-2) probe and compute timestamps
+    let prep = prepare(&req.path, &req.selection, state)?;
+    let duration = prep.duration;
+    let video_aspect = prep.aspect();
+    let timestamps = &prep.timestamps;
+
+    // 3) compute collage output size and rects
+    let (out_w, out_h, rects) = match &req.collage {
+        CollageSpec::Grid { rows, cols, spacing, margin, width, height, background: _ } => {
+            let (ow, oh) = derive_output_size_grid(*width, *height, video_aspect, *rows, *cols, *spacing, *margin);
+            let rects = compute_grid_layout(*rows, *cols, *spacing, *margin, ow, oh);
+            (ow, oh, rects)
+        }
+        CollageSpec::Advanced { pieces, spacing, margin, width, height, background: _ } => {
+            let (ow, oh) = derive_output_size_adv(*width, *height, video_aspect);
+            let rects = compute_advanced_layout(&pieces, *margin, *spacing, ow, oh);
+            (ow, oh, rects)
+        }
+    };
+
+    let fit_mode = req.fit.unwrap_or(FitMode::Cover);
+    let thumb_hint_w = req.thumb_w.unwrap_or(0);
+    let thumb_hint_h = req.thumb_h.unwrap_or(0);
+
+    // One target per timestamp: its rect's size, or the hint for timestamps without a rect
+    let targets: Vec<FrameTarget> = (0..timestamps.len()).map(|i| match rects.get(i) {
+        Some(r) => FrameTarget { w: r.w, h: r.h, fit: fit_mode },
+        None => FrameTarget { w: thumb_hint_w.max(160), h: thumb_hint_h.max(90), fit: fit_mode },
+    }).collect();
+
+    // Create progress tracker for fallback 0 (seek mode)
+    let mut tracker = ProgressTracker::new(
+        job_id.clone(),
+        req.path.clone(),
+        state.progress_tx.clone(),
+        state.progress_interval_ms,
+        0
+    );
+
+    // 4) Extract frames
+    let extracted = extract(&prep, &targets, req.force_fallback, req.skip_blank_frames, state, &mut tracker)?;
+    let imgs = extracted.frames;
+    let meta_path = prep.meta_path.clone();
 
     // 5) Compose collage canvas and paste frames
     let bg = match &req.collage {
@@ -647,6 +844,7 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
         "duration": duration,
         "size": { "w": out_w, "h": out_h },
         "frames": frames_meta,
+        "fallback_level": extracted.fallback_level,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "config": {
             "selection": &req.selection,
@@ -669,6 +867,229 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
     let collage_with_meta = insert_jpeg_com(&collage_buf, &meta_bytes)?;
 
     Ok((collage_with_meta, overall_meta))
+}
+
+/// Checks on a `/frames` request that need no video, run before a worker is taken
+fn validate_frames_request(req: &FramesRequest) -> Result<()> {
+    match &req.selection {
+        FrameSelection::Timestamps { timestamps } if timestamps.is_empty() => return bad_request("selection has no timestamps"),
+        FrameSelection::Uniform { frames: 0, .. } => return bad_request("selection has no frames"),
+        _ => {}
+    }
+    if req.size.width == Some(0) || req.size.height == Some(0) {
+        return bad_request("size: width and height must be at least 1");
+    }
+    if let Some(level) = req.force_fallback {
+        if level > 2 { return bad_request("force_fallback must be 0, 1 or 2"); }
+    }
+    validate_output(req.format, req.quality, &req.output, "")
+}
+
+/// Checks on `format`, `quality` and `output`, shared by `/frames` and `/scenes`.
+/// `field_prefix` names where the fields sit in the request (e.g. "frames.").
+fn validate_output(format: ImageFormat, quality: Option<u8>, output: &OutputSpec, field_prefix: &str) -> Result<()> {
+    match (format, quality) {
+        (ImageFormat::Png, Some(_)) => return bad_request(format!("{}quality applies to jpeg only", field_prefix)),
+        (_, Some(q)) if !(1..=100).contains(&q) => return bad_request(format!("{}quality must be 1-100", field_prefix)),
+        _ => {}
+    }
+    if let OutputSpec::Files { dir, prefix } = output {
+        if dir.as_deref().map_or(true, str::is_empty) {
+            return bad_request(format!("{}output.dir is required with output.mode \"files\"", field_prefix));
+        }
+        if let Some(p) = prefix {
+            if p.contains('/') || p.contains('\\') || p.contains("..") {
+                return bad_request(format!("{}output.prefix must not contain a path separator or \"..\"", field_prefix));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encode one output frame: JPEG (without its COM marker; `deliver_frames` adds it) or PNG
+fn encode_frame(img: &DynamicImage, format: ImageFormat, quality: Option<u8>) -> Result<Vec<u8>> {
+    let rgb = DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut buf: Vec<u8> = Vec::new();
+    match format {
+        ImageFormat::Jpeg => rgb.write_to(&mut std::io::Cursor::new(&mut buf), ImageOutputFormat::Jpeg(quality.unwrap_or(80)))?,
+        ImageFormat::Png => rgb.write_to(&mut std::io::Cursor::new(&mut buf), ImageOutputFormat::Png)?,
+    }
+    Ok(buf)
+}
+
+/// An encoded output frame: its bytes, its entry in the reply, and (JPEG only) the JSON for its
+/// COM marker
+struct EncodedFrame { bytes: Vec<u8>, meta: serde_json::Value, com: Option<serde_json::Value> }
+
+/// Deliver encoded frames as `output` says: base64 `data` in each entry (inline), or files
+/// `{prefix}{index}.{ext}` in `output.dir`, the index zero-padded to at least `min_digits`.
+/// Files written are deleted again if a later one fails. `None` entries stay `null`.
+fn deliver_frames(frames: Vec<Option<EncodedFrame>>, output: &OutputSpec, format: ImageFormat, min_digits: usize) -> Result<Vec<serde_json::Value>> {
+    let files_out = match output {
+        OutputSpec::Files { dir, prefix } => {
+            let dir = PathBuf::from(dir.as_deref().unwrap_or_default());
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("cannot create output dir {}", dir.display()))?;
+            Some((dir, prefix.clone().unwrap_or_else(|| DEFAULT_FRAME_PREFIX.to_string())))
+        }
+        OutputSpec::Inline {} => None,
+    };
+    let digits = (frames.len().saturating_sub(1).to_string().len()).max(min_digits);
+    let mut written = WrittenFiles { paths: Vec::new(), keep: false };
+    let mut out = Vec::with_capacity(frames.len());
+    for (i, frame) in frames.into_iter().enumerate() {
+        let Some(EncodedFrame { bytes, mut meta, com }) = frame else {
+            out.push(serde_json::Value::Null);
+            continue;
+        };
+        let bytes = match com {
+            Some(com) => insert_jpeg_com(&bytes, &serde_json::to_vec(&com)?)?,
+            None => bytes,
+        };
+        match &files_out {
+            Some((dir, prefix)) => {
+                let file = dir.join(format!("{}{:0width$}.{}", prefix, i, format.extension(), width = digits));
+                std::fs::write(&file, &bytes).with_context(|| format!("cannot write {}", file.display()))?;
+                meta["file"] = serde_json::json!(file.to_string_lossy());
+                written.paths.push(file);
+            }
+            None => {
+                meta["data"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            }
+        }
+        out.push(meta);
+    }
+    written.keep = true;
+    Ok(out)
+}
+
+/// The output size of every frame of a `/frames` job, and the target the extractors decode to.
+/// Only `cover` decodes larger than the output; it is centre-cropped afterwards.
+fn frames_target(size: &SizeSpec, src_w: u32, src_h: u32) -> FrameTarget {
+    let aspect = src_w as f64 / src_h as f64;
+    let from_w = |w: u32| ((w as f64 / aspect).round() as u32).max(1);
+    let from_h = |h: u32| ((h as f64 * aspect).round() as u32).max(1);
+    match (size.width, size.height) {
+        (None, None) => FrameTarget { w: src_w, h: src_h, fit: FitMode::Stretch },
+        (Some(w), None) => FrameTarget { w, h: from_w(w), fit: FitMode::Stretch },
+        (None, Some(h)) => FrameTarget { w: from_h(h), h, fit: FitMode::Stretch },
+        (Some(w), Some(h)) => match size.fit.unwrap_or(FitMode::Contain) {
+            FitMode::Contain => {
+                // The largest size with the video's aspect inside the box
+                if aspect > w as f64 / h as f64 {
+                    FrameTarget { w, h: from_w(w), fit: FitMode::Stretch }
+                } else {
+                    FrameTarget { w: from_h(h), h, fit: FitMode::Stretch }
+                }
+            }
+            FitMode::Cover => FrameTarget { w, h, fit: FitMode::Cover },
+            FitMode::Stretch => FrameTarget { w, h, fit: FitMode::Stretch },
+        },
+    }
+}
+
+/// Bring an extracted frame to exactly the target size (centre crop for `cover`)
+fn finish_frame(img: &DynamicImage, target: FrameTarget) -> DynamicImage {
+    if img.width() == target.w && img.height() == target.h {
+        return img.clone();
+    }
+    let fitted = fit_frame_to_rect(img.width(), img.height(), Rect { x: 0, y: 0, w: target.w, h: target.h }, FitMode::Cover);
+    let crop = img.crop_imm(fitted.src_rect.x, fitted.src_rect.y, fitted.src_rect.w, fitted.src_rect.h);
+    if crop.width() != target.w || crop.height() != target.h {
+        crop.resize_exact(target.w, target.h, imageops::FilterType::Lanczos3)
+    } else {
+        crop
+    }
+}
+
+/// Deletes the files a `/frames` job wrote unless the job completes
+struct WrittenFiles { paths: Vec<PathBuf>, keep: bool }
+
+impl Drop for WrittenFiles {
+    fn drop(&mut self) {
+        if !self.keep {
+            for p in &self.paths {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+}
+
+/// Blocking processing for `POST /frames`: the shared extraction, then one image per frame,
+/// inline as base64 or written to `output.dir`. Returns the JSON reply.
+fn process_frames(req: &FramesRequest, state: &AppState, job_id: String) -> Result<serde_json::Value> {
+    let prep = prepare(&req.path, &req.selection, state)?;
+    let count = prep.timestamps.len();
+    if count == 0 {
+        return bad_request("selection has no frames");
+    }
+    let target = frames_target(&req.size, prep.width, prep.height);
+    let targets = vec![target; count];
+
+    let mut tracker = ProgressTracker::new(
+        job_id,
+        req.path.clone(),
+        state.progress_tx.clone(),
+        state.progress_interval_ms,
+        0
+    );
+    let extracted = extract(&prep, &targets, req.force_fallback, req.skip_blank_frames, state, &mut tracker)?;
+
+    let quality = match req.format {
+        ImageFormat::Jpeg => Some(req.quality.unwrap_or(state.jpeg_quality)),
+        ImageFormat::Png => None,
+    };
+    let mut encoded = Vec::with_capacity(count);
+    for (i, frame) in extracted.frames.iter().enumerate() {
+        let Some((img, actual_ts)) = frame else {
+            encoded.push(None);
+            continue;
+        };
+        let requested_ts = prep.timestamps[i];
+        let bytes = encode_frame(&finish_frame(img, target), req.format, quality)?;
+        let com = quality.map(|_| {
+            let mut com = serde_json::json!({
+                "duration": prep.duration,
+                "index": i,
+                "timestamp_requested": requested_ts,
+                "timestamp_actual": actual_ts,
+            });
+            if let Some(p) = &prep.meta_path {
+                com["video"] = serde_json::json!(p);
+            }
+            com
+        });
+        let meta = serde_json::json!({
+            "index": i,
+            "timestamp_requested": requested_ts,
+            "timestamp_actual": actual_ts,
+        });
+        encoded.push(Some(EncodedFrame { bytes, meta, com }));
+    }
+    let frames_meta = deliver_frames(encoded, &req.output, req.format, 3)?;
+
+    let mut reply = serde_json::json!({
+        "duration": prep.duration,
+        "source": { "w": prep.width, "h": prep.height },
+        "size": { "w": target.w, "h": target.h },
+        "format": req.format,
+        "fallback_level": extracted.fallback_level,
+        "frames": frames_meta,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "config": {
+            "selection": &req.selection,
+            "size": &req.size,
+            "format": req.format,
+            "quality": quality,
+            "output": &req.output,
+            "skip_blank_frames": req.skip_blank_frames,
+            "force_fallback": req.force_fallback,
+        }
+    });
+    if let Some(p) = &prep.meta_path {
+        reply["video"] = serde_json::json!(p);
+    }
+    Ok(reply)
 }
 
 /// Insert a JPEG COM marker immediately after the SOI marker (0xFFD8).
@@ -701,20 +1122,61 @@ fn insert_jpeg_com(jpeg: &[u8], comment: &[u8]) -> Result<Vec<u8>> {
 
 /// Probe duration (seconds). Uses stream duration if available, otherwise container duration.
 fn probe_duration(path: &str) -> Result<f64> {
+    probe_duration_opt(path)?.ok_or_else(|| anyhow::anyhow!("could not determine duration"))
+}
+
+/// The duration from the headers: the video stream's, else the container's. `None` when
+/// neither is set (a broken or truncated file); an error only if the file can't be opened or
+/// has no video stream.
+fn probe_duration_opt(path: &str) -> Result<Option<f64>> {
     let ictx = ffmpeg::format::input(&path)?;
     let stream = ictx.streams().best(ffmpeg::media::Type::Video).ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     if stream.duration() > 0 {
         let tb = stream.time_base();
-        let dur = stream.duration() as f64 * (tb.0 as f64 / tb.1 as f64);
-        Ok(dur)
-    } else {
-        let dur = ictx.duration();
-        if dur > 0 {
-            // container duration is in AV_TIME_BASE (microseconds)
-            Ok((dur as f64) / (ffmpeg_next::ffi::AV_TIME_BASE as f64))
+        return Ok(Some(stream.duration() as f64 * (tb.0 as f64 / tb.1 as f64)));
+    }
+    let dur = ictx.duration();
+    // container duration is in AV_TIME_BASE (microseconds)
+    Ok((dur > 0).then(|| dur as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64))
+}
+
+/// A video stream's clock: its time base and the timestamp of its start. Every time the service
+/// reports or seeks to is relative to that start, so a video starts at 0 even when its
+/// timestamps don't (MPEG-TS/PS start at 1.4 s or at a broadcast clock's hours, MP4 edit lists
+/// slightly off 0, streams cut without re-encoding anywhere).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timeline {
+    tick: f64,
+    start: i64,
+}
+
+impl Timeline {
+    /// The stream's `start_time`, else the container's, else 0
+    pub(crate) fn of(ictx: &ffmpeg::format::context::Input, vs: &ffmpeg::format::stream::Stream) -> Timeline {
+        let tb = vs.time_base();
+        let tick = tb.0 as f64 / tb.1 as f64;
+        let start = if vs.start_time() != ffi::AV_NOPTS_VALUE {
+            vs.start_time()
         } else {
-            anyhow::bail!("could not determine duration");
-        }
+            let f = unsafe { (*ictx.as_ptr()).start_time };
+            if f != ffi::AV_NOPTS_VALUE { (f as f64 / ffi::AV_TIME_BASE as f64 / tick).round() as i64 } else { 0 }
+        };
+        Timeline { tick, start }
+    }
+
+    /// Seconds from the start for a timestamp in stream ticks
+    pub(crate) fn secs(&self, ts: i64) -> f64 {
+        (ts - self.start) as f64 * self.tick
+    }
+
+    /// Stream ticks for seconds from the start
+    pub(crate) fn ticks(&self, secs: f64) -> i64 {
+        (secs / self.tick) as i64 + self.start
+    }
+
+    /// Seconds for a length in ticks (no start offset)
+    pub(crate) fn len(&self, ticks: i64) -> f64 {
+        ticks as f64 * self.tick
     }
 }
 
@@ -732,10 +1194,7 @@ fn probe_dimensions(path: &str) -> Result<(u32,u32)> {
 fn extract_frames_seek_each(
     path: &str,
     timestamps: &[f64],
-    rects: &[Rect],
-    thumb_w_hint: u32,
-    thumb_h_hint: u32,
-    fit_mode: FitMode,
+    targets: &[FrameTarget],
     video_aspect: f64,
     allow_corrupt: bool,
     tracker: &mut ProgressTracker,
@@ -750,8 +1209,7 @@ fn extract_frames_seek_each(
         .best(ffmpeg::media::Type::Video)
         .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let stream_index = vs.index();
-    let tb = vs.time_base();
-    let seconds_per_tick = tb.0 as f64 / tb.1 as f64;
+    let tl = Timeline::of(&ictx, &vs);
     let codec_params = vs.parameters();
 
     // Create decoder ONCE
@@ -773,9 +1231,7 @@ fn extract_frames_seek_each(
     let mut require_keyframe = true;
 
     for (i, &ts) in timestamps.iter().enumerate() {
-        // Target size hint
-        let target_w = if i < rects.len() { rects[i].w } else { thumb_w_hint.max(160) };
-        let target_h = if i < rects.len() { rects[i].h } else { thumb_h_hint.max(90) };
+        let target = targets[i];
 
         // Try extracting frame, with retry if blank frame detected
         let mut current_ts = ts;
@@ -785,7 +1241,7 @@ fn extract_frames_seek_each(
 
         loop {
             // Seek to timestamp using low-level API
-            let target_pts = (current_ts / seconds_per_tick) as i64;
+            let target_pts = tl.ticks(current_ts);
 
             // Use unsafe FFmpeg API directly since the safe wrapper doesn't seem to work
             unsafe {
@@ -801,7 +1257,7 @@ fn extract_frames_seek_each(
             decoder.flush();
 
             // Extract frame at this position
-            frame_result = extract_frame_after_seek(&mut ictx, &mut decoder, stream_index, seconds_per_tick, current_ts, target_w, target_h, fit_mode, video_aspect, require_keyframe, duration);
+            frame_result = extract_frame_after_seek(&mut ictx, &mut decoder, stream_index, tl, current_ts, target, video_aspect, require_keyframe, duration);
 
             // No keyframe packet near the target: the stream doesn't flag keyframes (e.g.
             // intra-refresh H.264). Retry this position without the keyframe requirement.
@@ -867,50 +1323,46 @@ fn extract_frames_seek_each(
 /// Used as fallback when normal seeking fails extensively.
 /// Decodes sequentially from start, capturing frames at target timestamps.
 /// Uses a two-pass approach: first with keyframe skipping (fast), then without if needed (slow).
+/// Also returns the level that produced the frames (1 keyframes, 2 sequential).
 fn extract_frames_with_genpts(
     path: &str,
     timestamps: &[f64],
-    rects: &[Rect],
-    thumb_w_hint: u32,
-    thumb_h_hint: u32,
-    fit_mode: FitMode,
+    targets: &[FrameTarget],
     video_aspect: f64,
     allow_fallback: u8,
     duration: f64,
     skip_blank_frames: bool,
     tracker: &mut ProgressTracker,
-) -> Result<Vec<Option<(DynamicImage, f64)>>> {
+) -> Result<(Vec<Option<(DynamicImage, f64)>>, u8)> {
     // First pass: try with keyframe skipping (fast) - this is fallback level 1
     tracker.fallback_level = 1;
     tracker.force_update(0.0, "Trying keyframe-only mode".to_string());
-    let results = extract_frames_sequential(path, timestamps, rects, thumb_w_hint, thumb_h_hint, fit_mode, video_aspect, true, duration, skip_blank_frames, tracker)?;
+    let results = extract_frames_sequential(path, timestamps, targets, video_aspect, true, duration, skip_blank_frames, tracker)?;
 
     // Check if we got any frames
     let captured = results.iter().filter(|r| r.is_some()).count();
     if captured > 0 {
         tracker.force_update(1.0, format!("Keyframe mode completed: {}/{} frames", captured, timestamps.len()));
-        return Ok(results);
+        return Ok((results, 1));
     }
 
     // Level 1: Only keyframe fallback allowed, don't try sequential
     if allow_fallback == 1 {
-        return Ok(results);
+        return Ok((results, 1));
     }
 
     // Level 2: Try sequential decode as second pass
     tracker.fallback_level = 2;
     tracker.force_update(0.0, "Trying sequential decode (all frames)".to_string());
-    extract_frames_sequential(path, timestamps, rects, thumb_w_hint, thumb_h_hint, fit_mode, video_aspect, false, duration, skip_blank_frames, tracker)
+    let results = extract_frames_sequential(path, timestamps, targets, video_aspect, false, duration, skip_blank_frames, tracker)?;
+    Ok((results, 2))
 }
 
 /// Internal function to decode frames sequentially with optional keyframe skipping
 fn extract_frames_sequential(
     path: &str,
     timestamps: &[f64],
-    rects: &[Rect],
-    thumb_w_hint: u32,
-    thumb_h_hint: u32,
-    fit_mode: FitMode,
+    targets: &[FrameTarget],
     video_aspect: f64,
     keyframes_only: bool,
     duration: f64,
@@ -933,8 +1385,7 @@ fn extract_frames_sequential(
         .best(ffmpeg::media::Type::Video)
         .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let stream_index = vs.index();
-    let tb = vs.time_base();
-    let seconds_per_tick = tb.0 as f64 / tb.1 as f64;
+    let tl = Timeline::of(&ictx, &vs);
     let codec_params = vs.parameters();
 
     let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)?
@@ -976,8 +1427,7 @@ fn extract_frames_sequential(
 
         while decoder.receive_frame(&mut decoded).is_ok() {
             frames_decoded += 1;
-            let frame_pts = decoded.timestamp().or(packet.dts()).unwrap_or(0);
-            let frame_seconds = frame_pts as f64 * seconds_per_tick;
+            let frame_seconds = decoded.timestamp().or(packet.dts()).map_or(0.0, |ts| tl.secs(ts));
 
             // Update progress based on video position
             let progress = (frame_seconds / duration).min(1.0);
@@ -1016,11 +1466,8 @@ fn extract_frames_sequential(
                         }
 
                         // This frame is close enough to our target and has no errors
-                        let target_w = if orig_idx < rects.len() { rects[orig_idx].w } else { thumb_w_hint.max(160) };
-                        let target_h = if orig_idx < rects.len() { rects[orig_idx].h } else { thumb_h_hint.max(90) };
-
                         // Scale frame based on fit mode
-                        if let Ok(img) = decode_and_scale_frame(&decoded, target_w, target_h, fit_mode, video_aspect) {
+                        if let Ok(img) = decode_and_scale_frame(&decoded, targets[orig_idx], video_aspect) {
                             results[orig_idx] = Some((img, frame_seconds));
                             // Only move to next target if we successfully captured this one
                             target_idx += 1;
@@ -1071,7 +1518,6 @@ fn is_blank_by_variance(samples: &[f32]) -> bool {
         .map(|&x| (x - mean).powi(2))
         .sum::<f32>() / samples.len() as f32;
 
-    println!("Blank check: variance={:.2}, mean={:.2}, samples={}", variance, mean, samples.len());
 
     // Low variance frames (solid colors)
     if variance < 500.0 {
@@ -1088,7 +1534,6 @@ fn is_blank_by_variance(samples: &[f32]) -> bool {
     if mean < 25.0 && variance < 3000.0 {
         return true;
     }
-    println!("NOT BLANK: variance={:.2}, mean={:.2}, samples={}", variance, mean, samples.len());
     false
 }
 
@@ -1148,11 +1593,10 @@ fn is_blank_image(img: &DynamicImage) -> bool {
 /// Helper to decode and scale a single frame
 fn decode_and_scale_frame(
     decoded: &FfmpegFrame,
-    target_w: u32,
-    target_h: u32,
-    fit_mode: FitMode,
+    target: FrameTarget,
     video_aspect: f64,
 ) -> Result<DynamicImage> {
+    let FrameTarget { w: target_w, h: target_h, fit: fit_mode } = target;
     // Calculate scaled dimensions based on fit mode
     let (scale_w, scale_h) = match fit_mode {
         FitMode::Stretch => (target_w, target_h),
@@ -1232,11 +1676,9 @@ fn extract_frame_after_seek(
     ictx: &mut ffmpeg::format::context::Input,
     decoder: &mut ffmpeg::decoder::Video,
     stream_index: usize,
-    seconds_per_tick: f64,
+    tl: Timeline,
     timestamp: f64,
-    target_w: u32,
-    target_h: u32,
-    fit_mode: FitMode,
+    target: FrameTarget,
     video_aspect: f64,
     require_keyframe: bool,
     duration: f64,
@@ -1262,7 +1704,7 @@ fn extract_frame_after_seek(
             } else {
                 skipped_packets += 1;
                 let past_window = packet.dts()
-                    .map(|dts| dts as f64 * seconds_per_tick > timestamp + KEYFRAME_SEARCH_WINDOW_SECS)
+                    .map(|dts| tl.secs(dts) > timestamp + KEYFRAME_SEARCH_WINDOW_SECS)
                     .unwrap_or(false);
                 if past_window || skipped_packets >= KEYFRAME_SEARCH_MAX_PACKETS {
                     return Err(NoKeyframeFound.into());
@@ -1278,8 +1720,7 @@ fn extract_frame_after_seek(
             frames_decoded += 1;
 
             // Get frame timestamp (best effort: falls back to DTS for containers without PTS, e.g. AVI)
-            let frame_pts = decoded.timestamp().or(packet.dts()).unwrap_or(0);
-            let frame_seconds = frame_pts as f64 * seconds_per_tick;
+            let frame_seconds = decoded.timestamp().or(packet.dts()).map_or(0.0, |ts| tl.secs(ts));
 
             // Calculate distance from target
             let distance = (frame_seconds - timestamp).abs();
@@ -1320,7 +1761,7 @@ fn extract_frame_after_seek(
     }
 
     let best_frame = best_frame.ok_or_else(|| anyhow::anyhow!("no frames found"))?;
-    let img = decode_and_scale_frame(&best_frame, target_w, target_h, fit_mode, video_aspect)?;
+    let img = decode_and_scale_frame(&best_frame, target, video_aspect)?;
     Ok((img, best_frame_timestamp, had_errors_in_group))
 }
 

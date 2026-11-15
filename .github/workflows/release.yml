@@ -38,10 +38,13 @@ jobs:
         run: |
           VERSION="${{ steps.get_version.outputs.version }}"
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          # Carry the version into Cargo.lock too (only the workspace's own entry, no dependency
+          # changes), so a local build doesn't leave the lock file modified
+          cargo update --workspace
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
-          # Skip the commit if Cargo.toml already has this version (e.g. re-running a failed release)
+          git add Cargo.toml Cargo.lock
+          # Skip the commit if the version is already set (e.g. re-running a failed release)
           git diff --cached --quiet || git commit -m "chore: bump version to ${VERSION}"
           git tag "${{ steps.get_version.outputs.tag }}"
           git push origin HEAD:${{ github.ref_name }}
@@ -106,6 +109,7 @@ jobs:
           Copy-Item "target\x86_64-pc-windows-msvc\release\thumbs-collage.exe" "$ARCHIVE\"
           Copy-Item "README.md" "$ARCHIVE\"
           Copy-Item "LICENSE" "$ARCHIVE\"
+          Copy-Item "PYSCENEDETECT-LICENSE.txt" "$ARCHIVE\"
 
           # Copy FFmpeg DLLs, plus FFmpeg's license and where its source lives (GPL)
           $ffmpegDir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
@@ -176,7 +180,7 @@ jobs:
           ARCHIVE="thumbs-collage-${VERSION}-linux-x86_64"
           mkdir -p "$ARCHIVE"
           cp "target/x86_64-unknown-linux-gnu/release/thumbs-collage" "$ARCHIVE/"
-          cp "README.md" "LICENSE" "$ARCHIVE/"
+          cp "README.md" "LICENSE" "PYSCENEDETECT-LICENSE.txt" "$ARCHIVE/"
 
           # FFmpeg shared libraries, plus FFmpeg's license and where its source lives (GPL)
           cp -a "$FFMPEG_DIR"/lib/lib*.so.* "$ARCHIVE/"
@@ -244,7 +248,7 @@ jobs:
           ARCHIVE="thumbs-collage-${VERSION}-macos-aarch64"
           mkdir -p "$ARCHIVE"
           cp "target/aarch64-apple-darwin/release/thumbs-collage" "$ARCHIVE/"
-          cp "README.md" "LICENSE" "$ARCHIVE/"
+          cp "README.md" "LICENSE" "PYSCENEDETECT-LICENSE.txt" "$ARCHIVE/"
           tar -czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
 
       - name: Upload Release Asset

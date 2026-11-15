@@ -4,7 +4,7 @@ Implementation notes for working on this codebase. User-facing docs (API, CLI op
 
 ## Overview
 
-`thumbs-collage` is an HTTP service that extracts frames from a video at given timestamps and assembles them into a JPEG collage (grid or custom layout). Everything is in `src/main.rs`.
+`thumbs-collage` is an HTTP service that extracts frames from a video at given timestamps and assembles them into a JPEG collage (grid or custom layout, `POST /make_collage`), returns them as separate images (`POST /frames`), or detects scene cuts (`POST /scenes`). Collage and frames code is in `src/main.rs`; scene detection is in `src/scenes.rs` (detectors, hints, adaptive layer, flash filter, the job) and `src/scene_frames.rs` (frame placement, candidates, trimming).
 
 - **Stack**: Axum 0.6 (HTTP + WebSocket), Tokio, `ffmpeg-next` 8.x, `image`/`imageproc`, `rusttype` for timestamp text, serde.
 - **FFmpeg**: must be 8.x. `ffmpeg-next` 8 does not build against FFmpeg 9 (Homebrew's default `ffmpeg` and BtbN's `master` builds are 9.x; CI pins 8.1).
@@ -17,17 +17,29 @@ cargo build --release                  # Linux/macOS: needs FFmpeg 8 dev libs, c
 set FFMPEG_DIR=C:\path\to\ffmpeg-8.x   # Windows: build.rs copies %FFMPEG_DIR%\bin\*.dll next to the exe
 ```
 
-There are no automated tests yet. Verify changes by running the server and POSTing to `/make_collage` against real files, including corrupt ones and AVI/RealVideo.
+`cargo test` runs unit tests for scene detection (flash filter and adaptive reference values from the labelled-set replay, HSV against OpenCV, hint resolution, placement and trimming) a synthetic-clip test with known cuts, and the goldens: the clips described in `tests/golden/clips.json` are regenerated (lossless FFV1, 256x144, so neither tool downscales) and compared with PySceneDetect 0.7.3's output in `tests/golden/content.json` (per-frame `content_val`, adaptive ratio, cuts; currently exact) and with `ffmpeg ... scdet` run at test time. Both need the FFmpeg CLI (`FFMPEG_DIR\bin` or PATH) and are skipped without it. Regenerate `content.json` with `scripts/make_goldens.py` (Python + `scenedetect==0.7.3`, by hand) whenever `clips.json` changes. No real videos are in the repo; the F1 check on the labelled set lives outside it, with the labels. Everything else is verified by running the server and POSTing to the endpoints against real files, including corrupt ones and AVI/RealVideo.
 
 ## Request Flow
 
-1. `make_collage` (async handler) takes a semaphore permit with `try_acquire_owned`; a full semaphore returns 429 immediately, no queueing.
-2. `process_video` runs in `spawn_blocking`: `resolve_paths` → `probe_duration` / `probe_dimensions` → compute timestamps → layout → extraction tiers → draw frames and timestamps on the canvas → encode JPEG → `insert_jpeg_com`.
-3. Metadata is returned twice: in a JPEG COM marker and base64 in the `X-Collage-Meta-B64` header. It includes the full request config (`selection`, `collage`, ...), so those types derive both `Serialize` and `Deserialize`.
+1. Both handlers go through `run_job`: it takes a semaphore permit with `try_acquire_owned` (a full semaphore returns 429 immediately, no queueing), runs the job in `spawn_blocking`, and maps errors with `job_error_response` (a `BadRequest` error is 400, anything else 500, message printed with `{:#}` so context chains show).
+2. Shared steps, used by both endpoints:
+   - `prepare`: `resolve_paths` → `probe_duration` / `probe_dimensions` → timestamps from the selection, in request order.
+   - `extract`: the extraction tiers and failure thresholds, for one `FrameTarget { w, h, fit }` per timestamp. Returns the frames plus `fallback_level`, the tier that produced them (0 seek, 1 keyframes, 2 sequential; `extract_frames_with_genpts` reports which of its passes succeeded).
+3. `/make_collage` → `process_video`: layout → targets from the rects (a timestamp without a rect gets `thumb_w`/`thumb_h` `.max(160)`/`.max(90)`) → `extract` → draw frames and timestamps on the canvas → encode JPEG → `insert_jpeg_com`. Metadata is returned twice: in a JPEG COM marker and base64 in the `X-Collage-Meta-B64` header. It includes the full request config (`selection`, `collage`, ...), so those types derive both `Serialize` and `Deserialize`.
+4. `/frames` → `validate_frames_request` (in the async handler, before a permit is taken) → `process_frames`: `frames_target` computes one target for all frames from `size` → `extract` → `finish_frame` (centre crop, only `cover` decodes larger than the output) → encode JPEG (with a per-frame COM marker) or PNG → base64 inline or written to `output.dir`. `WrittenFiles` deletes the job's files on drop unless the job completes.
+   - `FramesRequest`, `SizeSpec` and `OutputSpec` use `deny_unknown_fields` (422 on typos); `JobRequest` stays lenient. `OutputSpec::Inline {}` is an empty struct variant because serde ignores unknown fields on unit variants of internally tagged enums.
+   - `validate_output`, `encode_frame` and `deliver_frames` (base64 or files, `WrittenFiles` cleanup, COM marker added at delivery) are shared with `/scenes`.
+5. `/scenes` → `scenes::validate_request` (before the permit) → `scenes::process_scenes`:
+   - Duration: `probe_duration_opt` (no error when the headers have none, no 1 s minimum). Both passes return `end` (the last frame or packet time plus a frame), and `resolve_duration` uses it only when the headers have no duration (a timestamp jump, as in DVD cells, can put the end hours too late). Progress is time over the probed duration, or bytes over the file size without one. Frames or packets with no timestamp at all (raw elementary streams) get the previous one's plus a frame interval.
+   - `resolve` merges the `hint`'s defaults under explicit fields and refuses fields the detector doesn't use (400). `adaptive` is `Option<Option<_>>` (absent / `null` / object) via the `present` deserializer.
+   - `keyframes`: `detect_keyframes` reads packet flags only; more than 50% keys → `Unprocessable` (422). With `frames`, placement and trimming run first, then the shared `extract` (seek tiers) fetches the targets.
+   - `scdet` / `content`: `detect_decoded` is one sequential GENPTS pass with frame-threaded decoding (drained with `send_eof`), each frame scaled to the analysis size (256 px wide, `analysis_size`): YUV420P bicubic for `scdet` (luma plane only, as FFmpeg's `scdet` does on planar YUV, so it matches `scale=256:-2,scdet`), for `content`, bilinear to YUV444P then converted to RGB24 at the small size (swscale's direct scale-to-RGB24 was the bottleneck), then OpenCV's fixed-point BGR2HSV in `HsvTables`. Errored frames get no score. Fails if fewer frames decode than half the video packets (not duration × frame rate: AVI's `avg_frame_rate`/`nb_frames` can be 5× off). Known limitation: field-coded (PAFF) H.264, as in interlaced TV `.ts` recordings, has a packet per field, so intact files decode 48-50% and fail; the README points to `skip_nonref`. A time-based check limited to MPEG-TS was considered and left until a real need. `skip_nonref` sets `skip_frame = AVDISCARD_NONREF` (the threshold drops to 20% of packets, and a frame with no timestamp is an error, since a frame interval can't bridge skipped frames); any error in that pass reruns `detect_decoded` without it and a fresh `Collector`, and `stats.skipped_nonref` reports `false`.
+   - `CutPipeline` = cut test (threshold, or the adaptive ratio over a ±window buffer, judged `window` frames late; edge frames count as below) → `FlashFilter` (PySceneDetect's merge/suppress with the length in seconds; `off` = suppress). It reproduces the labelled-set replay (`evalx.py`) exactly.
+   - Frames: `scene_frames::Collector` samples a candidate every `every/4`, restarting at each scene's first frame, and never slows down: a cut becomes final late (adaptive window, a pending merge), and the next scene needs candidates from its start. A sampled frame at or after `CutPipeline::settled_before` (a later cut could still separate it from the open scene) is held unscaled, as an `av_frame_ref` to the decoder's buffers (at most `MAX_HELD`, 16; past that the oldest is resolved anyway). Once settled, or when a cut after it closes its scene, it is scaled only if it fits the scene's spacing, which starts at every sample and doubles while more than 8 × `max_per_scene` candidates remain, so most frames of a long scene are never scaled (memory bounded, speed as before the fix below). (Doubling the sampling step itself, as before, starved short scenes after a long one; scaling every sample to avoid that cost 11–32% on a 10-minute single-scene clip.) A timestamp jump backward restarts sampling. When a new cut appears in `pipeline.cuts` it picks the nearest candidate per placed target and encodes it. Then `trim` (per-scene counts), `thin` (which picks to keep), and `deliver_frames` with 4-digit names.
 
 ## Extraction Tiers
 
-All extractors return `Vec<Option<(DynamicImage, f64)>>`; the `f64` is the **actual** frame timestamp, which goes into the metadata as `timestamp_actual` and is what gets rendered.
+All extractors take `targets: &[FrameTarget]` (one per timestamp, passed to `decode_and_scale_frame`) and return `Vec<Option<(DynamicImage, f64)>>`; the `f64` is the **actual** frame timestamp, which goes into the metadata as `timestamp_actual` and is what gets rendered.
 
 ### Tier 1: `extract_frames_seek_each`
 One input context; for each timestamp `av_seek_frame(..., AVSEEK_FLAG_BACKWARD)` (raw FFI, the safe wrapper was unreliable), `decoder.flush()`, then `extract_frame_after_seek`.
@@ -40,13 +52,13 @@ One input context; for each timestamp `av_seek_frame(..., AVSEEK_FLAG_BACKWARD)`
 - **Blank retry** (when `skip_blank_frames`): `is_blank_image` → seek +2.5s, up to 10 retries.
 
 ### Tier 2/3: `extract_frames_with_genpts` → `extract_frames_sequential`
-Triggered in `process_video` when more than a third of Tier 1 frames are `None` (and `--allow-fallback` ≥ 1).
+Triggered in `extract` when more than a third of Tier 1 frames are `None` (and `--allow-fallback` ≥ 1).
 - `extract_frames_sequential` opens with `AVFMT_FLAG_GENPTS`, sorts timestamps, and decodes in one pass. FFmpeg logging is set to `Fatal` here to suppress corruption spam.
 - **Tier 2** calls it with `keyframes_only = true` (`AVDISCARD_NONKEY`), accepting only clean keyframes.
 - **Tier 3** (only if Tier 2 captured zero frames and `--allow-fallback 2`) decodes every frame. Accepts frames from 10s before to 45s after the target. Needed for RealVideo, where skipping non-keyframes breaks references.
 - Blank frames are checked with `is_blank_frame` (FFmpeg frame, stride-aware).
 
-### Failure thresholds (`process_video`)
+### Failure thresholds (`extract`)
 | `--allow-fallback` | Fails when |
 |---|---|
 | 0 | >33% of frames fail in seek mode |
@@ -75,7 +87,10 @@ Triggered in `process_video` when more than a third of Tier 1 frames are `None` 
 
 - **Default bind** is `127.0.0.1:0` (random port); the server prints `Listening on http://<addr>` so a parent process can parse the port.
 - **`--exit-on-stdin-close`**: `spawn_stdin_close_watcher` exits the process when stdin hits EOF/errors, so it dies with a parent that spawned it with a piped stdin.
+- **Timeline**: every time reported or seeked to is relative to the video stream's `start_time` (else the container's, else 0), via `Timeline` (`secs`, `ticks`). MPEG-TS/PS start at 1.4 s or at a broadcast clock's hours; before this, seeks on such files landed on the first frame. Timestamp discontinuities (joined DVD cells, spliced TS) are not handled: the probed duration covers only part of such a file. Seen on a library VOB (110→607 s, a jump to 95,444 s for ~50 s, then 51→502 s; header 391 s, content ~1,000 s). A possible fix: in the `/scenes` decode passes, continue from the previous frame's time on a backward jump or a large forward one (careful with genuine VFR gaps); `/frames` and `/make_collage` would need byte-based seeking.
 - **Paths**: `resolve_paths` simply joins `--root-path` with the request path. This is not a sandbox (absolute paths and `..` escape it, and FFmpeg accepts URLs). The service assumes trusted callers.
+- **Writing**: `/frames` with `output.mode: "files"` writes into any `output.dir` it is given (created with `create_dir_all`, not joined to `--root-path`). Same trusted-callers stance; `prefix` is only checked for path separators and `..`.
+- **stdout**: only the `Listening on` line goes to stdout; diagnostics go to stderr. A parent that stops reading a piped stdout would otherwise block the service once the pipe fills.
 - **`metadata_text`** is accepted in the request but unused.
 - **FFmpeg 8 API**: keyframe detection uses `flags & AV_FRAME_FLAG_KEY`, not the removed `key_frame` field.
 
@@ -86,4 +101,4 @@ Triggered in `process_video` when more than a third of Tier 1 frames are `None` 
 - **Linux x86_64**: same BtbN build via `FFMPEG_DIR`, `.so` files bundled, binary linked with `-rpath,$ORIGIN` and `--disable-new-dtags` (DT_RPATH, so it also covers the FFmpeg libraries' dependencies on each other). Built on `ubuntu-22.04` to keep the glibc requirement low; a smoke step fails the job if `ldd` resolves FFmpeg outside the archive.
 - **macOS aarch64**: Homebrew `ffmpeg@8` (keg-only, via `PKG_CONFIG_PATH`), not bundled; the binary hard-codes `/opt/homebrew/opt/ffmpeg@8/lib`.
 
-Windows and Linux archives carry `FFMPEG-LICENSE.txt` and `FFMPEG-NOTICE.txt` (exact FFmpeg version and source links) for GPL compliance.
+Windows and Linux archives carry `FFMPEG-LICENSE.txt` and `FFMPEG-NOTICE.txt` (exact FFmpeg version and source links) for GPL compliance. All archives carry `PYSCENEDETECT-LICENSE.txt`: the BSD-3 notice for the code ported into `src/scenes.rs`.

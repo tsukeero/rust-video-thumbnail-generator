@@ -1,6 +1,6 @@
 # Video Thumbnail Collage Service
 
-A Rust HTTP service that extracts frames from videos and assembles them into thumbnail collages. Built on FFmpeg for decoding and Axum for async HTTP.
+A Rust HTTP service that extracts frames from videos and assembles them into thumbnail collages, returns them as separate images, or detects scene cuts. Built on FFmpeg for decoding and Axum for async HTTP.
 
 ## Features
 
@@ -8,6 +8,8 @@ A Rust HTTP service that extracts frames from videos and assembles them into thu
 - 🛡️ **Corruption Handling**: Multi-tier fallback (seek → keyframe-only → full sequential decode) for damaged videos
 - 🎬 **Frame Selection**: Uniformly spaced frames or explicit timestamps
 - 🖼️ **Flexible Layouts**: Grid mode or custom percentage-based layouts
+- 🎞️ **Separate Frames**: `POST /frames` returns each frame as its own JPEG or PNG, inline or written to a folder
+- ✂️ **Scene Detection**: `POST /scenes` finds scene cuts (PySceneDetect-style content and adaptive detectors, FFmpeg's `scdet`, or keyframes) and can pick frames per scene in the same pass
 - ⏱️ **Timestamp Overlays**: Optional timestamp rendering showing the actual extracted frame time
 - 📊 **Embedded Metadata**: JSON metadata in the JPEG COM marker and an HTTP header
 - 🎨 **Fit Modes**: Cover, contain, or stretch
@@ -252,6 +254,7 @@ If only `width` or only `height` is given, the other is derived from the video a
       "rect": {"x": 10, "y": 10, "w": 280, "h": 210}
     }
   ],
+  "fallback_level": 0,
   "config": {
     "selection": {"mode": "uniform", "frames": 25},
     "collage": {"mode": "grid", "rows": 5, "cols": 5},
@@ -263,12 +266,221 @@ If only `width` or only `height` is given, the other is derived from the video a
 }
 ```
 
-`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`.
+`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`. `fallback_level` is the extraction tier that produced the frames (see [Multi-Tier Fallback](#multi-tier-fallback)).
 
 #### Error Responses
 
 - `429 Too Many Requests`: all `--max-workers` slots are busy
 - `500 Internal Server Error`: processing error, body is `{"error": "..."}`
+
+### Endpoint: `POST /frames`
+
+The same frame extraction as `/make_collage` (selection, blank-frame skipping, fallback tiers and failure thresholds), but each frame comes back as its own image instead of a collage.
+
+```json
+{
+  "path": "/videos/movie.mp4",
+  "selection": { "mode": "timestamps", "timestamps": [12.5, 80.0, 141.2] },
+  "size": { "width": 480, "height": 270, "fit": "cover" },
+  "format": "jpeg",
+  "quality": 85,
+  "output": { "mode": "files", "dir": "/thumbs/movie.frames", "prefix": "frame_" },
+  "skip_blank_frames": true
+}
+```
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `path` | string | Yes | As in `/make_collage` |
+| `selection` | object | Yes | As in `/make_collage`; must yield at least one timestamp |
+| `size` | object | No | `{ width?, height?, fit? }`, see below (default: the source size) |
+| `format` | string | No | `"jpeg"` or `"png"` (default: `"jpeg"`) |
+| `quality` | number | No | JPEG quality 1-100 (default: `--jpeg-quality`); refused with `png` |
+| `output` | object | No | `{"mode": "inline"}` (default) or `{"mode": "files", "dir": "...", "prefix": "frame_"}` |
+| `skip_blank_frames` | boolean | No | As in `/make_collage` (default: `false`) |
+| `force_fallback` | number | No | As in `/make_collage` |
+| `job_id` | string | No | Custom job ID for progress tracking |
+
+Unknown fields are refused (422), so a typo doesn't pass silently. Timestamps keep their request order; duplicates are allowed.
+
+**Size**: every frame of a job gets the same size.
+
+| Given | Result |
+|-------|--------|
+| neither side | the source's decoded size |
+| `width` or `height` only | the other side from the video's aspect ratio |
+| both, `fit: "contain"` (default) | the largest size with the video's aspect inside the box |
+| both, `fit: "cover"` | exactly `width` x `height`, scaled and centre-cropped |
+| both, `fit: "stretch"` | exactly `width` x `height`, distorted |
+
+**Output**:
+- `inline`: each image is base64 in the reply (`data`). The whole reply is held in memory, so keep counts small.
+- In both modes, every frame is held decoded (RGBA, at the output size; the source size without `size`) until extraction finishes, and only then encoded. Memory is about `frames × width × height × 4` bytes: 2,000 frames of a 4K source is about 66 GB, which aborts the whole process. Set `size` and keep counts reasonable.
+- `files`: images are written to `dir` (created if missing; not joined to `--root-path`) as `{prefix}{index}.jpg|png`, the index zero-padded to at least 3 digits (`frame_007.jpg`). Existing files with those names are overwritten; other files are left alone. If the job fails, the files it wrote are deleted. `prefix` may not contain a path separator or `..`.
+
+Each JPEG carries a COM marker with `{video, duration, index, timestamp_requested, timestamp_actual}`. PNG frames carry no metadata.
+
+#### Response
+
+`200 OK`, `application/json`:
+
+```json
+{
+  "video": "/videos/movie.mp4",
+  "duration": 1621.12,
+  "source": { "w": 1024, "h": 576 },
+  "size": { "w": 480, "h": 270 },
+  "format": "jpeg",
+  "fallback_level": 0,
+  "frames": [
+    { "index": 0, "timestamp_requested": 12.5, "timestamp_actual": 12.47, "file": "/thumbs/movie.frames/frame_000.jpg" },
+    null,
+    { "index": 2, "timestamp_requested": 141.2, "timestamp_actual": 141.17, "file": "/thumbs/movie.frames/frame_002.jpg" }
+  ],
+  "generated_at": "2026-11-13T10:00:00Z",
+  "config": { "selection": {}, "size": {}, "format": "jpeg", "quality": 85, "output": {}, "skip_blank_frames": true, "force_fallback": null }
+}
+```
+
+- `frames[i]` is `null` when frame `i` couldn't be decoded (within the `--allow-fallback` thresholds; beyond them the job fails).
+- In inline mode each frame has `data` (base64) instead of `file`.
+- `video` is omitted with `--no-path-meta`.
+
+#### Error Responses
+
+- `400 Bad Request`: invalid request (empty selection, `quality` with `png`, `width`/`height` of 0, missing `output.dir`, bad `prefix`, `force_fallback` above 2), body is `{"error": "..."}`
+- `422 Unprocessable Entity`: malformed JSON or an unknown field
+- `429 Too Many Requests`: all `--max-workers` slots are busy
+- `500 Internal Server Error`: probe, decode or write failure, or too many frames failed, body is `{"error": "..."}`
+
+### Endpoint: `POST /scenes`
+
+Detects scene cuts, and optionally picks frames from the scenes in the same decoding pass. The detectors, names and defaults follow [PySceneDetect](https://www.scenedetect.com/) (see [Credits](#credits)).
+
+```json
+{
+  "path": "/videos/episode01.mkv",
+  "hint": "real",
+  "frames": {
+    "every": 2.0, "max_per_scene": 3, "max_frames": 300,
+    "size": { "width": 448, "height": 448, "fit": "cover" },
+    "output": { "mode": "files", "dir": "/thumbs/episode01.scenes" }
+  },
+  "skip_blank_frames": true
+}
+```
+
+#### Request Body
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | required | As in `/make_collage` |
+| `hint` | string | none | `"anime"`, `"cg"` or `"real"` (also accepted as `"live_action"`; `config` reports `"real"`): what kind of video this is. Only picks the defaults below; explicit fields win |
+| `detector` | string | `"content"` | `"content"`, `"scdet"` or `"keyframes"` |
+| `threshold` | number | `content` 27, `scdet` 8 | Score at which a cut fires. Not with `keyframes` or `adaptive` |
+| `min_scene_len` | number | `0.6` | Minimum scene length in **seconds** |
+| `flash_filter` | string | `"merge"` | `"merge"`, `"suppress"` or `"off"`: how `min_scene_len` is enforced. Not with `keyframes` |
+| `weights` | object | `{"hue": 1, "sat": 1, "lum": 1}` | `content` only |
+| `adaptive` | object or `null` | from `hint` | `{ratio, window, min_score}`, see below. `null` turns off an adaptive layer the hint would add |
+| `frames` | object | none | Frame selection, see below. Without it only the scene list is returned |
+| `skip_blank_frames` | boolean | `false` | Frame selection only: a blank pick is replaced by the nearest non-blank candidate in the scene |
+| `skip_nonref` | boolean | `false` | `scdet` / `content` only: skip decoding frames no other frame references (most B-frames). About 1.3–2× faster, slightly less precise; see below |
+| `return_scores` | boolean | `false` | Adds the per-frame scores, for tuning |
+| `job_id` | string | generated | Custom job ID for progress tracking |
+
+Unknown fields are refused (422), and so are fields the chosen detector doesn't use (400).
+
+**Hints**: measured on 21 labelled three-minute segments (8 anime, 5 CG films, 8 live action, 898 labelled cuts).
+
+| `hint` | Detector | F1 |
+|--------|----------|----|
+| none | `content`, threshold 27, merge | 0.90 overall |
+| `anime` | `content`, threshold 27, merge | 0.92 |
+| `cg` | `content` + adaptive (ratio 3, `min_score` 15), merge | 0.95 |
+| `real` | `content` + adaptive (ratio 3, `min_score` 15), merge | 0.93 |
+
+The adaptive layer removes false cuts from continuous camera motion, but limited animation's held frames break its ratio test, hence the split.
+
+#### Detectors
+
+- **`content`** (default): a port of PySceneDetect's `ContentDetector`. Each frame is converted to HSV at 256 px wide, and the score is the weighted mean absolute difference of hue, saturation and value from the previous frame.
+- **`scdet`**: FFmpeg's `scdet` score (luma difference from the previous frame, as a percentage, compared with the previous difference), matching `ffmpeg -vf scale=256:-2,scdet`. Weak on very dark footage, where luma differences are tiny.
+- **`keyframes`**: a cut at every keyframe, from packet flags, with no decoding. Fast (well under a second for a full episode) but only as good as the encoder's keyframe placement: an F1 of 0.19-0.95 per video on the labelled set. Refused (422) when more than half of the packets are keyframes (all-intra codecs such as MJPEG, or an index that flags every packet).
+
+`content` and `scdet` decode every frame in one sequential pass, so they cost about one full decode of the video. A frame with decode errors gets no score; a pass that decodes fewer frames than half the video packets fails.
+
+**Adaptive layer** (`content` and `scdet`), a port of PySceneDetect's `AdaptiveDetector`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `ratio` | 3.0 | A cut needs `score / mean(score of the window frames on both sides) >= ratio` |
+| `window` | 2 | Frames on each side, 1 to 1000. The neighbourhood a frame is compared with, not a scene length |
+| `min_score` | `content` 15, `scdet` 4 | The score must also be at least this |
+
+**Flash filter**, a port of PySceneDetect's `FlashFilter`, with `min_scene_len` as its length:
+- `merge`: a burst of cuts closer together than `min_scene_len` becomes one cut, at its last frame.
+- `suppress`: cuts within `min_scene_len` of the last one are dropped.
+- `off`: no merging; `min_scene_len` still applies as in `suppress`. Set `min_scene_len: 0` for no minimum at all.
+
+#### Frames
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `every` | 2.0 | Seconds per frame: a scene gets `ceil(duration / every)` frames |
+| `min_per_scene` | 1 | At least this many per scene |
+| `max_per_scene` | 3 | At most this many per scene. Not capped: up to `8 × max_per_scene` candidates per open scene are kept in memory at the output size (the source size without `size`), so large values on high-resolution video use a lot of memory |
+| `margin` | 0.25 | Seconds skipped at both ends of a scene, at most 10% of the scene |
+| `max_frames` | none | Cap on the total |
+| `size`, `format`, `quality`, `output` | as `/frames` | Same fields and behaviour; file names are padded to at least 4 digits (`frame_0007.jpg`) |
+
+- A scene with `k` frames gets them evenly spread between its margins.
+- `max_frames` first removes frames down to `min_per_scene`, one at a time from the scene with the most, then drops whole scenes' frames, shortest scene first.
+- With `content` and `scdet`, frames are taken from candidates kept during the detection pass, so no second decode is needed. `timestamp` is the chosen frame's time, `target` the position placement asked for. Candidates are every `every / 4` seconds from each scene's start, so `timestamp` is within about `every / 8` of `target`; in scenes longer than about `2 × every × max_per_scene` they are thinned, and the distance grows (the targets there are far apart). A scene shorter than about `every / 2` may get fewer than `min_per_scene` frames.
+- With `keyframes`, frames are extracted afterwards by seeking, as in `/frames`. Known limitation: each `keyframes` scene is one GOP, and a seek lands on the keyframe before its target, so the picks of a scene longer than `every` are usually the same frame (near the scene start) repeated, with `timestamp` far from `target`. A pick can also come from another scene but be listed under this one: with `skip_blank_frames` (the retry moves forward 2.5 s at a time, up to 10 times) or when extraction falls back to the keyframe or sequential tiers (which accept frames from 10 s before to 45 s after the target). Use `content` or `scdet` when the frames matter.
+- Each JPEG carries a COM marker with `{video, duration, index, scene, target, timestamp}`.
+
+#### Response
+
+`200 OK`, `application/json`:
+
+```json
+{
+  "video": "/videos/episode01.mkv",
+  "duration": 1421.4,
+  "detector": "content",
+  "scenes": [
+    { "index": 0, "start": 0.0, "end": 8.508, "frames": [0, 1, 2] },
+    { "index": 1, "start": 8.508, "end": 14.514, "frames": [3, 4, 5] }
+  ],
+  "frames": [
+    { "index": 0, "scene": 0, "target": 1.53, "timestamp": 1.543, "file": "/thumbs/episode01.scenes/frame_0000.jpg" }
+  ],
+  "size": { "w": 448, "h": 448 },
+  "format": "jpeg",
+  "stats": { "decoded_frames": 34080, "errored_frames": 0, "candidates": 2210, "trimmed_frames": 334, "elapsed_s": 21.4 },
+  "generated_at": "2026-11-13T10:00:00Z",
+  "config": { "hint": "real", "detector": "content", "min_scene_len": 0.6, "flash_filter": "merge", "weights": {}, "adaptive": { "ratio": 3.0, "window": 2, "min_score": 15.0 }, "frames": {} }
+}
+```
+
+- `scenes` is always present. Times are in seconds from the start of the video (its first timestamp, so MPEG-TS and VOB files start at 0 too, as in every endpoint), `end` is exclusive, and the last `end` is `duration`.
+- `duration` comes from the headers, or, when they have none, from where the detection pass saw the video end (streams written to a pipe, raw elementary streams, truncated files). Unlike `/make_collage` and `/frames`, `/scenes` needs neither a header duration nor a video longer than 1 s.
+- `frames`, `size` and `format` are present only when frames were requested; inline mode puts `data` (base64) in place of `file`.
+- `scores` (with `return_scores`): `{ "t": [...], "score": [...], "ratio": [...] }`, one entry per scored frame; `ratio` only with `adaptive`.
+- `config` holds the resolved settings, the hint's defaults filled in.
+
+**`skip_nonref`**: the decoder drops frames that no other frame is predicted from (FFmpeg's `skip_frame = nonref`), so only 40–55% of frames are decoded and scored (MPEG-2 and MPEG-4 ASP skip every B-frame; H.264/HEVC keep the B-frames used as references). Measured on 23–31 min anime episodes: 1.3–2× faster (e.g. 1080p HEVC 82 → 51 s, MPEG-2 TS 115 → 69 s). The cost: a cut can only be seen at the next decoded frame, so about 1 cut in 8 comes one or two frames late, and scores between frames further apart are higher, so a few more motion-heavy cuts are wrongly found. On the labelled set, F1 falls from 0.930 to 0.923 with a `hint` (0.896 to 0.873 without one, 0.886 to 0.884 for `scdet`). Frames are picked from the decoded frames only. If the pass fails (a frame without a timestamp, as in raw elementary streams, whose time can't be inferred past skipped frames; fewer than 20% of packets decoded; any decode error), the job reruns decoding every frame. `stats.skipped_nonref` says which happened.
+
+**Tuning**: request `return_scores: true` and look at `score` around cuts that were missed or wrongly found. Lower `threshold` (or `adaptive.min_score`) for missed cuts, raise it for false ones; raise `adaptive.ratio` if camera motion still produces false cuts.
+
+#### Error Responses
+
+- `400 Bad Request`: invalid request (a field the detector doesn't use, `threshold` with `adaptive`, negative values, `min_per_scene` above `max_per_scene`, the `output` rules of `/frames`)
+- `422 Unprocessable Entity`: malformed JSON or an unknown field; `keyframes` on a video where most packets are keyframes
+- `429 Too Many Requests`: all `--max-workers` slots are busy
+- `500 Internal Server Error`: probe, decode or write failure, or fewer frames decoded than half the video packets
 
 ### Endpoint: `GET /ws-progress` (WebSocket)
 
@@ -345,12 +557,14 @@ Blank frames trigger a seek 2.5 seconds forward, up to 10 times. The metadata re
 | H.264 with corruption | Keyframe-only | 1-5s for 25 frames | Damaged downloads |
 | RealVideo (.rm) | Sequential | 30-180s for 25 frames | Old formats |
 
-Concurrency is limited by `--max-workers`; memory use is roughly one decoded frame plus the output canvas per active job.
+Concurrency is limited by `--max-workers`. Memory per active job: for `/make_collage`, roughly one decoded frame plus the output canvas; for `/frames`, every requested frame decoded at the output size until extraction finishes (see Output above); for `/scenes`, the analysis copy plus up to `8 × max_per_scene` candidates per open scene and up to 16 held decoder frames.
 
 ## Project Structure
 
 ```
 ├── src/main.rs                 # Service implementation
+├── src/scenes.rs               # /scenes: detectors, adaptive layer, flash filter
+├── src/scene_frames.rs         # /scenes: frame placement, candidates, trimming
 ├── build.rs                    # Copies FFmpeg DLLs on Windows
 ├── test_ws_progress_deno.ts    # Example Deno client with progress bars
 ├── .github/workflows/          # Release builds (Windows, Linux, macOS)
@@ -370,6 +584,14 @@ deno run --allow-net --allow-read --allow-write \
 ```
 
 ## Troubleshooting
+
+### Timestamp jumps inside a file (known limitation)
+
+Times are counted from the video's first timestamp, which handles files that don't start at 0 (MPEG-TS, VOB). Files whose timestamps *jump* partway through are not handled: DVD rips that join several cells, or spliced TV recordings. On such a file the header duration covers only part of the video, and frames or scenes past the jump come back at the wrong time or are missing. Remuxing the file (`ffmpeg -fflags +genpts -i in.vob -c copy out.mkv`) usually gives it continuous timestamps.
+
+### Interlaced TV recordings: "too damaged for scene detection" (known limitation)
+
+`/scenes` with `content` or `scdet` refuses a video when fewer frames decode than half its video packets. Field-coded interlaced H.264 (typical of TV recordings in `.ts`) stores each field as its own packet, so even an intact file decodes just under half and gets a 500. Use `skip_nonref: true` (its pass accepts 20%) or `detector: "keyframes"`.
 
 ### Windows: `STATUS_DLL_NOT_FOUND`
 
@@ -398,7 +620,11 @@ Expected when blank frames are skipped or fallback extraction is used. Compare `
 1. **Seek accuracy**: not frame-accurate; seek mode returns the first clean frame after the nearest preceding keyframe.
 2. **Blank detection**: variance-based, so it can miss low-detail frames that aren't solid or flag very dark scenes.
 3. **One video per request**.
-4. **No access control**: the service opens whatever path it is given (`--root-path` is a base directory, not a sandbox), has no authentication, and broadcasts job file paths to every WebSocket client. Run it on localhost or behind something that controls access, for trusted callers only.
+4. **No access control**: the service opens whatever path it is given (`--root-path` is a base directory, not a sandbox), has no authentication, and broadcasts job file paths to every WebSocket client. `/frames` with `output.mode: "files"` also **writes** to any folder it is given. Run it on localhost or behind something that controls access, for trusted callers only; don't bind it to a public interface.
+
+## Credits
+
+The `content` detector, the adaptive layer, the flash filter and their setting names and defaults are ported from [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) (BSD-3-Clause, Copyright (C) 2014, Brandon Castellano; see [PYSCENEDETECT-LICENSE.txt](PYSCENEDETECT-LICENSE.txt), also shipped in the release archives). The `scdet` detector reimplements the score of FFmpeg's `scdet` filter.
 
 ## License
 

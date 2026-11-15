@@ -377,7 +377,7 @@ Detects scene cuts, and optionally picks frames from the scenes in the same deco
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `path` | string | required | As in `/make_collage` |
-| `hint` | string | none | `"anime"`, `"cg"` or `"real"`: what kind of video this is. Only picks the defaults below; explicit fields win |
+| `hint` | string | none | `"anime"`, `"cg"` or `"real"` (also accepted as `"live_action"`; `config` reports `"real"`): what kind of video this is. Only picks the defaults below; explicit fields win |
 | `detector` | string | `"content"` | `"content"`, `"scdet"` or `"keyframes"` |
 | `threshold` | number | `content` 27, `scdet` 8 | Score at which a cut fires. Not with `keyframes` or `adaptive` |
 | `min_scene_len` | number | `0.6` | Minimum scene length in **seconds** |

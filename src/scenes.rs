@@ -65,7 +65,13 @@ where
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Hint { Anime, Cg, Real }
+pub(crate) enum Hint {
+    Anime,
+    Cg,
+    /// `live_action` is accepted too (as classifiers may name it); `config` reports `real`
+    #[serde(alias = "live_action")]
+    Real,
+}
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -1084,6 +1090,15 @@ mod tests {
         let mut s = vec![0.0; 100];
         s[40] = 20.0;
         assert_eq!(run(&s, &c), vec![40.0 / 25.0]);
+    }
+
+    #[test]
+    fn live_action_is_an_alias_for_real() {
+        let parse = |h: &str| serde_json::from_value::<ScenesRequest>(serde_json::json!({ "path": "x", "hint": h })).map(|r| r.hint);
+        assert_eq!(parse("live_action").unwrap(), Some(Hint::Real));
+        assert_eq!(parse("real").unwrap(), Some(Hint::Real));
+        assert!(parse("live-action").is_err());
+        assert_eq!(serde_json::to_value(Hint::Real).unwrap(), "real");
     }
 
     #[test]

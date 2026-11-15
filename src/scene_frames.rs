@@ -268,11 +268,13 @@ impl<'a> Collector<'a> {
         self.candidates = rest;
         let k = wanted(self.spec, start, end);
         let mut used = vec![false; cands.len()];
+        // Once per candidate (each check copies the image), not once per target
+        let blank: Vec<bool> = if self.skip_blank { cands.iter().map(|(_, img)| is_blank_image(img)).collect() } else { Vec::new() };
         let mut chosen = Vec::new();
         for target in place(self.spec, start, end, k) {
             let nearest = |want_clear: bool, cands: &[(f64, DynamicImage)], used: &[bool]| {
                 (0..cands.len())
-                    .filter(|&i| !used[i] && (!want_clear || !is_blank_image(&cands[i].1)))
+                    .filter(|&i| !used[i] && (!want_clear || !blank[i]))
                     .min_by(|&a, &b| (cands[a].0 - target).abs().partial_cmp(&(cands[b].0 - target).abs()).unwrap())
             };
             let pick = if self.skip_blank {

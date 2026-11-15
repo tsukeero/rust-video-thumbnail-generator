@@ -317,6 +317,7 @@ Unknown fields are refused (422), so a typo doesn't pass silently. Timestamps ke
 
 **Output**:
 - `inline`: each image is base64 in the reply (`data`). The whole reply is held in memory, so keep counts small.
+- In both modes, every frame is held decoded (RGBA, at the output size; the source size without `size`) until extraction finishes, and only then encoded. Memory is about `frames × width × height × 4` bytes: 2,000 frames of a 4K source is about 66 GB, which aborts the whole process. Set `size` and keep counts reasonable.
 - `files`: images are written to `dir` (created if missing; not joined to `--root-path`) as `{prefix}{index}.jpg|png`, the index zero-padded to at least 3 digits (`frame_007.jpg`). Existing files with those names are overwritten; other files are left alone. If the job fails, the files it wrote are deleted. `prefix` may not contain a path separator or `..`.
 
 Each JPEG carries a COM marker with `{video, duration, index, timestamp_requested, timestamp_actual}`. PNG frames carry no metadata.
@@ -415,7 +416,7 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 | Field | Default | Description |
 |-------|---------|-------------|
 | `ratio` | 3.0 | A cut needs `score / mean(score of the window frames on both sides) >= ratio` |
-| `window` | 2 | Frames on each side |
+| `window` | 2 | Frames on each side, 1 to 1000. The neighbourhood a frame is compared with, not a scene length |
 | `min_score` | `content` 15, `scdet` 4 | The score must also be at least this |
 
 **Flash filter**, a port of PySceneDetect's `FlashFilter`, with `min_scene_len` as its length:
@@ -429,7 +430,7 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 |-------|---------|-------------|
 | `every` | 2.0 | Seconds per frame: a scene gets `ceil(duration / every)` frames |
 | `min_per_scene` | 1 | At least this many per scene |
-| `max_per_scene` | 3 | At most this many per scene |
+| `max_per_scene` | 3 | At most this many per scene. Not capped: up to `8 × max_per_scene` candidates per open scene are kept in memory at the output size (the source size without `size`), so large values on high-resolution video use a lot of memory |
 | `margin` | 0.25 | Seconds skipped at both ends of a scene, at most 10% of the scene |
 | `max_frames` | none | Cap on the total |
 | `size`, `format`, `quality`, `output` | as `/frames` | Same fields and behaviour; file names are padded to at least 4 digits (`frame_0007.jpg`) |
@@ -437,7 +438,7 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 - A scene with `k` frames gets them evenly spread between its margins.
 - `max_frames` first removes frames down to `min_per_scene`, one at a time from the scene with the most, then drops whole scenes' frames, shortest scene first.
 - With `content` and `scdet`, frames are taken from candidates kept during the detection pass, so no second decode is needed. `timestamp` is the chosen frame's time, `target` the position placement asked for. Candidates are every `every / 4` seconds from each scene's start, so `timestamp` is within about `every / 8` of `target`; in scenes longer than about `2 × every × max_per_scene` they are thinned, and the distance grows (the targets there are far apart). A scene shorter than about `every / 2` may get fewer than `min_per_scene` frames.
-- With `keyframes`, frames are extracted afterwards by seeking, as in `/frames`.
+- With `keyframes`, frames are extracted afterwards by seeking, as in `/frames`. Known limitation: each `keyframes` scene is one GOP, and a seek lands on the keyframe before its target, so the picks of a scene longer than `every` are usually the same frame (near the scene start) repeated, with `timestamp` far from `target`. A pick can also come from another scene but be listed under this one: with `skip_blank_frames` (the retry moves forward 2.5 s at a time, up to 10 times) or when extraction falls back to the keyframe or sequential tiers (which accept frames from 10 s before to 45 s after the target). Use `content` or `scdet` when the frames matter.
 - Each JPEG carries a COM marker with `{video, duration, index, scene, target, timestamp}`.
 
 #### Response
@@ -556,7 +557,7 @@ Blank frames trigger a seek 2.5 seconds forward, up to 10 times. The metadata re
 | H.264 with corruption | Keyframe-only | 1-5s for 25 frames | Damaged downloads |
 | RealVideo (.rm) | Sequential | 30-180s for 25 frames | Old formats |
 
-Concurrency is limited by `--max-workers`; memory use is roughly one decoded frame plus the output canvas per active job.
+Concurrency is limited by `--max-workers`. Memory per active job: for `/make_collage`, roughly one decoded frame plus the output canvas; for `/frames`, every requested frame decoded at the output size until extraction finishes (see Output above); for `/scenes`, the analysis copy plus up to `8 × max_per_scene` candidates per open scene and up to 16 held decoder frames.
 
 ## Project Structure
 
@@ -587,6 +588,10 @@ deno run --allow-net --allow-read --allow-write \
 ### Timestamp jumps inside a file (known limitation)
 
 Times are counted from the video's first timestamp, which handles files that don't start at 0 (MPEG-TS, VOB). Files whose timestamps *jump* partway through are not handled: DVD rips that join several cells, or spliced TV recordings. On such a file the header duration covers only part of the video, and frames or scenes past the jump come back at the wrong time or are missing. Remuxing the file (`ffmpeg -fflags +genpts -i in.vob -c copy out.mkv`) usually gives it continuous timestamps.
+
+### Interlaced TV recordings: "too damaged for scene detection" (known limitation)
+
+`/scenes` with `content` or `scdet` refuses a video when fewer frames decode than half its video packets. Field-coded interlaced H.264 (typical of TV recordings in `.ts`) stores each field as its own packet, so even an intact file decodes just under half and gets a 500. Use `skip_nonref: true` (its pass accepts 20%) or `detector: "keyframes"`.
 
 ### Windows: `STATUS_DLL_NOT_FOUND`
 

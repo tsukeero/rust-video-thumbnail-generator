@@ -124,6 +124,8 @@ const MAX_KEYFRAME_SHARE: f64 = 0.5;
 /// A decode pass that yields fewer frames than this share of the video packets read fails.
 /// (Packets, not duration x frame rate: AVI's `avg_frame_rate` and `nb_frames` can be off by 5x.)
 const MIN_DECODED_SHARE: f64 = 0.5;
+/// Largest `adaptive.window` (frames on each side): about 40 s at 24 fps
+const MAX_ADAPTIVE_WINDOW: usize = 1000;
 /// The same with `skip_nonref`: skipped frames count as packets but decode nothing (MPEG-2
 /// with two B-frames per P decodes a third). Below it, the full decode runs and checks again.
 const MIN_DECODED_SHARE_SKIPPING: f64 = 0.2;
@@ -197,7 +199,11 @@ pub(crate) fn resolve(req: &ScenesRequest) -> Result<Resolved> {
                 }),
             };
             if !(a.ratio > 0.0 && a.ratio.is_finite()) { return bad_request("adaptive.ratio must be above 0"); }
-            if a.window < 1 { return bad_request("adaptive.window must be at least 1"); }
+            // The window is a neighbourhood, not a scene length. Far larger ones flatten the
+            // comparison, cost window x frames, and past 2^63 overflow
+            if !(1..=MAX_ADAPTIVE_WINDOW).contains(&a.window) {
+                return bad_request(&format!("adaptive.window must be 1 to {MAX_ADAPTIVE_WINDOW}"));
+            }
             if !(a.min_score >= 0.0 && a.min_score.is_finite()) { return bad_request("adaptive.min_score must be 0 or more"); }
             Some(a)
         }
@@ -1078,6 +1084,19 @@ mod tests {
         let mut s = vec![0.0; 100];
         s[40] = 20.0;
         assert_eq!(run(&s, &c), vec![40.0 / 25.0]);
+    }
+
+    #[test]
+    fn adaptive_window_bounds() {
+        let check = |w: serde_json::Value| {
+            let req: ScenesRequest = serde_json::from_value(serde_json::json!({ "path": "x", "adaptive": { "window": w } })).unwrap();
+            validate_request(&req).is_ok()
+        };
+        assert!(check(serde_json::json!(1)));
+        assert!(check(serde_json::json!(1000)));
+        assert!(!check(serde_json::json!(0)));
+        assert!(!check(serde_json::json!(1001)));
+        assert!(!check(serde_json::json!(9223372036854775808u64)));
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub(crate) struct ScenesRequest {
     pub frames: Option<crate::scene_frames::SceneFramesSpec>,
     #[serde(default)]
     pub skip_blank_frames: bool,
+    /// `scdet` / `content`: don't decode frames no other frame references (most B-frames).
+    /// Faster, less precise; falls back to a full decode if that pass fails.
+    #[serde(default)]
+    pub skip_nonref: bool,
     #[serde(default)]
     pub return_scores: bool,
     #[serde(default)]
@@ -120,6 +124,9 @@ const MAX_KEYFRAME_SHARE: f64 = 0.5;
 /// A decode pass that yields fewer frames than this share of the video packets read fails.
 /// (Packets, not duration x frame rate: AVI's `avg_frame_rate` and `nb_frames` can be off by 5x.)
 const MIN_DECODED_SHARE: f64 = 0.5;
+/// The same with `skip_nonref`: skipped frames count as packets but decode nothing (MPEG-2
+/// with two B-frames per P decodes a third). Below it, the full decode runs and checks again.
+const MIN_DECODED_SHARE_SKIPPING: f64 = 0.2;
 
 /// The settings detection runs with: the hint's defaults merged under the explicit fields
 #[derive(serde::Serialize, Debug, Clone)]
@@ -539,6 +546,9 @@ pub(crate) struct Stats {
     pub candidates: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trimmed_frames: Option<usize>,
+    /// With `skip_nonref`: true if the pass skipped non-reference frames, false if it fell back
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_nonref: Option<bool>,
     pub elapsed_s: f64,
 }
 
@@ -653,6 +663,7 @@ pub(crate) fn detect_decoded(
     cfg: &Resolved,
     duration: Option<f64>,
     keep_scores: bool,
+    skip_nonref: bool,
     tracker: &mut ProgressTracker,
     mut sink: impl FnMut(PassFrame, &CutPipeline) -> Result<()>,
 ) -> Result<Detection> {
@@ -675,6 +686,9 @@ pub(crate) fn detect_decoded(
     let mut decoder = codec_ctx.decoder().video()?;
     unsafe {
         (*decoder.as_mut_ptr()).flags |= ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as i32;
+        if skip_nonref {
+            (*decoder.as_mut_ptr()).skip_frame = ffi::AVDiscard::AVDISCARD_NONREF;
+        }
     }
     // Suppress FFmpeg log spam for corrupted videos (as the sequential extractor does)
     ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Fatal);
@@ -701,6 +715,8 @@ pub(crate) fn detect_decoded(
         // No timestamp at all (GENPTS couldn't make one): one frame after the previous
         let t = match decoded.timestamp().or(packet_dts) {
             Some(ts) => tl.secs(ts),
+            // One interval would be wrong after skipped frames: decode them all instead
+            None if skip_nonref => anyhow::bail!("a frame without a timestamp while skipping non-reference frames"),
             None => last_t.map_or(0.0, |l| l + interval),
         };
         last_t = Some(t);
@@ -755,13 +771,15 @@ pub(crate) fn detect_decoded(
     if packets == 0 {
         anyhow::bail!("no video packets could be read");
     }
-    if (stats.decoded_frames as f64) < packets as f64 * MIN_DECODED_SHARE {
+    let min_share = if skip_nonref { MIN_DECODED_SHARE_SKIPPING } else { MIN_DECODED_SHARE };
+    if (stats.decoded_frames as f64) < packets as f64 * min_share {
         anyhow::bail!(
             "decoded only {} frames from {} video packets; the video is too damaged for scene detection",
             stats.decoded_frames, packets
         );
     }
     stats.elapsed_s = started.elapsed().as_secs_f64();
+    stats.skipped_nonref = skip_nonref.then_some(true);
     let CutPipeline { cuts, scores, .. } = pipeline;
     Ok(Detection { cuts, scores, stats, end })
 }
@@ -790,7 +808,10 @@ fn packed_plane(f: &FfmpegFrame, i: usize, row_bytes: usize, rows: usize) -> Vec
 
 /// Checks that need no video, run before a worker is taken
 pub(crate) fn validate_request(req: &ScenesRequest) -> Result<()> {
-    resolve(req)?;
+    let cfg = resolve(req)?;
+    if req.skip_nonref && cfg.detector == Detector::Keyframes {
+        return bad_request("skip_nonref applies to the scdet and content detectors (keyframes decodes nothing)");
+    }
     match &req.frames {
         Some(spec) => scene_frames::validate(spec)?,
         None if req.skip_blank_frames => return bad_request("skip_blank_frames applies to frame selection only; it needs frames"),
@@ -867,17 +888,31 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
             scores = None;
         }
         Detector::Scdet | Detector::Content => {
-            let mut collector = match (spec, target, source) {
+            let new_collector = || match (spec, target, source) {
                 (Some(spec), Some(target), Some((w, h))) =>
                     Some(Collector::new(spec, target, w as f64 / h as f64, quality, req.skip_blank_frames)),
                 _ => None,
             };
-            let det = detect_decoded(&video_path, &cfg, probed, req.return_scores, &mut tracker, |f, pipeline| {
-                match &mut collector {
-                    Some(c) => c.on_frame(f, pipeline),
-                    None => Ok(()),
+            let mut collector = new_collector();
+            let mut pass = |skip: bool, collector: &mut Option<Collector>, tracker: &mut ProgressTracker| {
+                detect_decoded(&video_path, &cfg, probed, req.return_scores, skip, tracker, |f, pipeline| {
+                    match collector {
+                        Some(c) => c.on_frame(f, pipeline),
+                        None => Ok(()),
+                    }
+                })
+            };
+            let det = match pass(req.skip_nonref, &mut collector, &mut tracker) {
+                Err(e) if req.skip_nonref => {
+                    eprintln!("[{}] skip_nonref pass failed ({e:#}); decoding every frame", req.path);
+                    collector = new_collector();
+                    tracker.force_update(0.0, "Detecting scenes".to_string());
+                    let mut det = pass(false, &mut collector, &mut tracker)?;
+                    det.stats.skipped_nonref = Some(false);
+                    det
                 }
-            })?;
+                r => r?,
+            };
             duration = resolve_duration(probed, det.end)?;
             scenes = scenes_from_cuts(&det.cuts, duration);
             stats = det.stats;
@@ -1093,7 +1128,7 @@ mod tests {
         // No duration given: the pass's own end has to match the headers'
         let det = match cfg.detector {
             Detector::Keyframes => detect_keyframes(path, &cfg, None, &mut tracker).unwrap(),
-            _ => detect_decoded(path, &cfg, None, false, &mut tracker, |_, _| Ok(())).unwrap(),
+            _ => detect_decoded(path, &cfg, None, false, false, &mut tracker, |_, _| Ok(())).unwrap(),
         };
         let probed = probe_duration_opt(path).unwrap().unwrap();
         assert!((det.end - probed).abs() <= 1.0 / 25.0 + 1e-6, "end {} vs probed {probed}", det.end);
@@ -1208,7 +1243,7 @@ mod tests {
             let cfg = resolve(&req_parsed).unwrap();
             let mut tracker = ProgressTracker::new("t".into(), path.clone(), None, 1000, 0);
             let mut c = Collector::new(&spec, target, 16.0 / 9.0, Some(80), false);
-            let det = detect_decoded(&path, &cfg, None, false, &mut tracker, |f, p| c.on_frame(f, p)).unwrap();
+            let det = detect_decoded(&path, &cfg, None, false, false, &mut tracker, |f, p| c.on_frame(f, p)).unwrap();
             let duration = resolve_duration(None, det.end).unwrap();
             c.finish(&det.cuts, duration).unwrap();
             let scenes = scenes_from_cuts(&det.cuts, duration);
@@ -1230,7 +1265,7 @@ mod tests {
         let cfg = resolve(&req).unwrap();
         let mut tracker = ProgressTracker::new("t".into(), path.into(), None, 1000, 0);
         let duration = probe_duration_opt(path).unwrap();
-        let det = detect_decoded(path, &cfg, duration, true, &mut tracker, |_, _| Ok(())).unwrap();
+        let det = detect_decoded(path, &cfg, duration, true, false, &mut tracker, |_, _| Ok(())).unwrap();
         let cuts = scenes_from_cuts(&det.cuts, resolve_duration(duration, det.end).unwrap()).iter().skip(1).map(|(s, _)| (s * fps).round() as i64).collect();
         (cuts, det.scores.unwrap())
     }

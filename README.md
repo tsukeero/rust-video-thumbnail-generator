@@ -385,6 +385,7 @@ Detects scene cuts, and optionally picks frames from the scenes in the same deco
 | `adaptive` | object or `null` | from `hint` | `{ratio, window, min_score}`, see below. `null` turns off an adaptive layer the hint would add |
 | `frames` | object | none | Frame selection, see below. Without it only the scene list is returned |
 | `skip_blank_frames` | boolean | `false` | Frame selection only: a blank pick is replaced by the nearest non-blank candidate in the scene |
+| `skip_nonref` | boolean | `false` | `scdet` / `content` only: skip decoding frames no other frame references (most B-frames). About 1.3–2× faster, slightly less precise; see below |
 | `return_scores` | boolean | `false` | Adds the per-frame scores, for tuning |
 | `job_id` | string | generated | Custom job ID for progress tracking |
 
@@ -468,6 +469,8 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 - `frames`, `size` and `format` are present only when frames were requested; inline mode puts `data` (base64) in place of `file`.
 - `scores` (with `return_scores`): `{ "t": [...], "score": [...], "ratio": [...] }`, one entry per scored frame; `ratio` only with `adaptive`.
 - `config` holds the resolved settings, the hint's defaults filled in.
+
+**`skip_nonref`**: the decoder drops frames that no other frame is predicted from (FFmpeg's `skip_frame = nonref`), so only 40–55% of frames are decoded and scored (MPEG-2 and MPEG-4 ASP skip every B-frame; H.264/HEVC keep the B-frames used as references). Measured on 23–31 min anime episodes: 1.3–2× faster (e.g. 1080p HEVC 82 → 51 s, MPEG-2 TS 115 → 69 s). The cost: a cut can only be seen at the next decoded frame, so about 1 cut in 8 comes one or two frames late, and scores between frames further apart are higher, so a few more motion-heavy cuts are wrongly found. On the labelled set, F1 falls from 0.930 to 0.923 with a `hint` (0.896 to 0.873 without one, 0.886 to 0.884 for `scdet`). Frames are picked from the decoded frames only. If the pass fails (a frame without a timestamp, as in raw elementary streams, whose time can't be inferred past skipped frames; fewer than 20% of packets decoded; any decode error), the job reruns decoding every frame. `stats.skipped_nonref` says which happened.
 
 **Tuning**: request `return_scores: true` and look at `score` around cuts that were missed or wrongly found. Lower `threshold` (or `adaptive.min_score`) for missed cuts, raise it for false ones; raise `adaptive.ratio` if camera motion still produces false cuts.
 

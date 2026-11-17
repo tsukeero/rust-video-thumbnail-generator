@@ -574,10 +574,24 @@ fn resolve_paths(req_path: &str, state: &AppState) -> Result<(String, Option<Str
     Ok((absolute_path, meta_path))
 }
 
+/// The file's fp1 fingerprint (`video-fingerprint`: size plus three sampled 64 KiB chunks), or
+/// `None` when it can't be read as a file (e.g. a URL FFmpeg opens itself)
+fn fingerprint(video_path: &str) -> Option<String> {
+    match video_fingerprint::fingerprint_file(video_path) {
+        Ok(fp) => Some(fp),
+        Err(e) => {
+            eprintln!("cannot fingerprint {}: {}", video_path, e);
+            None
+        }
+    }
+}
+
 /// What the probe step found out about a video, plus the timestamps the selection resolves to
 struct Prepared {
     video_path: String,
     meta_path: Option<String>,
+    /// See `fingerprint`; `None` where no metadata needs it
+    fingerprint: Option<String>,
     duration: f64,
     width: u32,
     height: u32,
@@ -613,7 +627,8 @@ fn prepare(path: &str, selection: &FrameSelection, state: &AppState) -> Result<P
         }
     };
 
-    Ok(Prepared { video_path, meta_path, duration, width, height, timestamps })
+    let fingerprint = fingerprint(&video_path);
+    Ok(Prepared { video_path, meta_path, fingerprint, duration, width, height, timestamps })
 }
 
 /// Frames from the extraction tiers, plus the tier that produced them
@@ -752,6 +767,7 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
     let extracted = extract(&prep, &targets, req.force_fallback, req.skip_blank_frames, state, &mut tracker)?;
     let imgs = extracted.frames;
     let meta_path = prep.meta_path.clone();
+    let fingerprint = prep.fingerprint.clone();
 
     // 5) Compose collage canvas and paste frames
     let bg = match &req.collage {
@@ -858,6 +874,9 @@ fn process_video(req: &JobRequest, state: &AppState, job_id: String) -> Result<(
     // Add video path if not excluded
     if let Some(path) = meta_path {
         meta_obj["video"] = serde_json::json!(path);
+    }
+    if let Some(fp) = fingerprint {
+        meta_obj["fingerprint"] = serde_json::json!(fp);
     }
 
     let overall_meta = meta_obj;
@@ -1057,6 +1076,9 @@ fn process_frames(req: &FramesRequest, state: &AppState, job_id: String) -> Resu
             if let Some(p) = &prep.meta_path {
                 com["video"] = serde_json::json!(p);
             }
+            if let Some(fp) = &prep.fingerprint {
+                com["fingerprint"] = serde_json::json!(fp);
+            }
             com
         });
         let meta = serde_json::json!({
@@ -1088,6 +1110,9 @@ fn process_frames(req: &FramesRequest, state: &AppState, job_id: String) -> Resu
     });
     if let Some(p) = &prep.meta_path {
         reply["video"] = serde_json::json!(p);
+    }
+    if let Some(fp) = &prep.fingerprint {
+        reply["fingerprint"] = serde_json::json!(fp);
     }
     Ok(reply)
 }

@@ -28,3 +28,4 @@ num_cpus = "1.16"
 bytes = "1.4"
 futures = "0.3"
 tower = "0.4"
+video-fingerprint = { git = "https://github.com/tsukeero/video-fingerprint" }

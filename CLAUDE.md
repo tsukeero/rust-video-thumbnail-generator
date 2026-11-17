@@ -91,6 +91,7 @@ Triggered in `extract` when more than a third of Tier 1 frames are `None` (and `
 - **Paths**: `resolve_paths` simply joins `--root-path` with the request path. This is not a sandbox (absolute paths and `..` escape it, and FFmpeg accepts URLs). The service assumes trusted callers.
 - **Writing**: `/frames` with `output.mode: "files"` writes into any `output.dir` it is given (created with `create_dir_all`, not joined to `--root-path`). Same trusted-callers stance; `prefix` is only checked for path separators and `..`.
 - **stdout**: only the `Listening on` line goes to stdout; diagnostics go to stderr. A parent that stops reading a piped stdout would otherwise block the service once the pipe fills.
+- **Fingerprint**: every COM marker and every reply carries `fingerprint`, the file's fp1 (`video-fingerprint` crate, git dependency on `tsukeero/video-fingerprint`; three 64 KiB reads), computed once per job by `fingerprint()` (in `prepare`, or at the start of `process_scenes`). Unlike `video` it is kept with `--no-path-meta`; it is omitted (stderr note) when the path can't be opened as a file, e.g. a URL. `Prepared` built inside `/scenes` for seek extraction sets it to `None`, as it does `meta_path`.
 - **`metadata_text`** is accepted in the request but unused.
 - **FFmpeg 8 API**: keyframe detection uses `flags & AV_FRAME_FLAG_KEY`, not the removed `key_frame` field.
 

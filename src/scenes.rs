@@ -15,7 +15,7 @@ use ffmpeg_next::software::scaling::{context::Context as Scaler, flag::Flags};
 use ffmpeg_next::util::frame::video::Video as FfmpegFrame;
 
 use crate::scene_frames::{self, Collector, Pick};
-use crate::{bad_request, deliver_frames, encode_frame, extract, finish_frame, frames_target, probe_dimensions,
+use crate::{bad_request, deliver_frames, encode_frame, extract, finish_frame, fingerprint, frames_target, probe_dimensions,
     probe_duration_opt, resolve_paths, AppState, Timeline, EncodedFrame, ImageFormat, Prepared, ProgressTracker, Unprocessable};
 
 // ---------------------------------------------------------------------------------------------
@@ -836,6 +836,7 @@ pub(crate) fn validate_request(req: &ScenesRequest) -> Result<()> {
 pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: String) -> Result<serde_json::Value> {
     let cfg = resolve(req)?;
     let (video_path, meta_path) = resolve_paths(&req.path, state)?;
+    let fingerprint = fingerprint(&video_path);
     // Not required: the passes read the whole file and see where it ends
     let probed = probe_duration_opt(&video_path)?;
     let mut tracker = ProgressTracker::new(job_id, req.path.clone(), state.progress_tx.clone(), state.progress_interval_ms, 0);
@@ -881,7 +882,7 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
                 stats_k.trimmed_frames = Some(before - wanted.len());
                 if !wanted.is_empty() {
                     let prep = Prepared {
-                        video_path: video_path.clone(), meta_path: None, duration, width: w, height: h,
+                        video_path: video_path.clone(), meta_path: None, fingerprint: None, duration, width: w, height: h,
                         timestamps: wanted.iter().map(|(_, t)| *t).collect(),
                     };
                     tracker.force_update(0.0, "Extracting frames".to_string());
@@ -962,6 +963,9 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
                     if let Some(path) = &meta_path {
                         com["video"] = serde_json::json!(path);
                     }
+                    if let Some(fp) = &fingerprint {
+                        com["fingerprint"] = serde_json::json!(fp);
+                    }
                     com
                 });
                 encoded.push(Some(EncodedFrame { bytes: p.bytes, meta, com }));
@@ -1006,6 +1010,9 @@ pub(crate) fn process_scenes(req: &ScenesRequest, state: &AppState, job_id: Stri
     }
     if let Some(p) = meta_path {
         reply["video"] = serde_json::json!(p);
+    }
+    if let Some(fp) = fingerprint {
+        reply["fingerprint"] = serde_json::json!(fp);
     }
     tracker.force_update(1.0, format!("Detected {} scenes", scenes.len()));
     Ok(reply)

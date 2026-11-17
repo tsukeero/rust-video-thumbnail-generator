@@ -245,6 +245,7 @@ If only `width` or only `height` is given, the other is derived from the video a
 ```json
 {
   "video": "/path/to/video.mp4",
+  "fingerprint": "fp1:0fa350dd73b368e5e2a391644eff4afc",
   "duration": 120.5,
   "size": {"w": 1440, "h": 1080},
   "frames": [
@@ -266,7 +267,7 @@ If only `width` or only `height` is given, the other is derived from the video a
 }
 ```
 
-`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`. `fallback_level` is the extraction tier that produced the frames (see [Multi-Tier Fallback](#multi-tier-fallback)).
+`timestamp_actual` may differ from `timestamp_requested` when blank frames are skipped, the seek lands on a nearby keyframe, or fallback extraction is used. `video` is omitted with `--no-path-meta`. `fingerprint` is the file's [fp1 fingerprint](https://github.com/tsukeero/video-fingerprint) (file size plus three sampled 64 KiB chunks, BLAKE3), a stable identity that survives renames and moves; it is kept with `--no-path-meta`, and omitted only when the path can't be read as a file (e.g. a URL). `fallback_level` is the extraction tier that produced the frames (see [Multi-Tier Fallback](#multi-tier-fallback)).
 
 #### Error Responses
 
@@ -320,7 +321,7 @@ Unknown fields are refused (422), so a typo doesn't pass silently. Timestamps ke
 - In both modes, every frame is held decoded (RGBA, at the output size; the source size without `size`) until extraction finishes, and only then encoded. Memory is about `frames × width × height × 4` bytes: 2,000 frames of a 4K source is about 66 GB, which aborts the whole process. Set `size` and keep counts reasonable.
 - `files`: images are written to `dir` (created if missing; not joined to `--root-path`) as `{prefix}{index}.jpg|png`, the index zero-padded to at least 3 digits (`frame_007.jpg`). Existing files with those names are overwritten; other files are left alone. If the job fails, the files it wrote are deleted. `prefix` may not contain a path separator or `..`.
 
-Each JPEG carries a COM marker with `{video, duration, index, timestamp_requested, timestamp_actual}`. PNG frames carry no metadata.
+Each JPEG carries a COM marker with `{video, fingerprint, duration, index, timestamp_requested, timestamp_actual}`. PNG frames carry no metadata.
 
 #### Response
 
@@ -329,6 +330,7 @@ Each JPEG carries a COM marker with `{video, duration, index, timestamp_requeste
 ```json
 {
   "video": "/videos/movie.mp4",
+  "fingerprint": "fp1:0fa350dd73b368e5e2a391644eff4afc",
   "duration": 1621.12,
   "source": { "w": 1024, "h": 576 },
   "size": { "w": 480, "h": 270 },
@@ -346,7 +348,7 @@ Each JPEG carries a COM marker with `{video, duration, index, timestamp_requeste
 
 - `frames[i]` is `null` when frame `i` couldn't be decoded (within the `--allow-fallback` thresholds; beyond them the job fails).
 - In inline mode each frame has `data` (base64) instead of `file`.
-- `video` is omitted with `--no-path-meta`.
+- `video` is omitted with `--no-path-meta`. `fingerprint` is as in [`/make_collage`](#metadata-format).
 
 #### Error Responses
 
@@ -439,7 +441,7 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 - `max_frames` first removes frames down to `min_per_scene`, one at a time from the scene with the most, then drops whole scenes' frames, shortest scene first.
 - With `content` and `scdet`, frames are taken from candidates kept during the detection pass, so no second decode is needed. `timestamp` is the chosen frame's time, `target` the position placement asked for. Candidates are every `every / 4` seconds from each scene's start, so `timestamp` is within about `every / 8` of `target`; in scenes longer than about `2 × every × max_per_scene` they are thinned, and the distance grows (the targets there are far apart). A scene shorter than about `every / 2` may get fewer than `min_per_scene` frames.
 - With `keyframes`, frames are extracted afterwards by seeking, as in `/frames`. Known limitation: each `keyframes` scene is one GOP, and a seek lands on the keyframe before its target, so the picks of a scene longer than `every` are usually the same frame (near the scene start) repeated, with `timestamp` far from `target`. A pick can also come from another scene but be listed under this one: with `skip_blank_frames` (the retry moves forward 2.5 s at a time, up to 10 times) or when extraction falls back to the keyframe or sequential tiers (which accept frames from 10 s before to 45 s after the target). Use `content` or `scdet` when the frames matter.
-- Each JPEG carries a COM marker with `{video, duration, index, scene, target, timestamp}`.
+- Each JPEG carries a COM marker with `{video, fingerprint, duration, index, scene, target, timestamp}`.
 
 #### Response
 
@@ -448,6 +450,7 @@ The adaptive layer removes false cuts from continuous camera motion, but limited
 ```json
 {
   "video": "/videos/episode01.mkv",
+  "fingerprint": "fp1:0fa350dd73b368e5e2a391644eff4afc",
   "duration": 1421.4,
   "detector": "content",
   "scenes": [
